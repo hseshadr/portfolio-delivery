@@ -1,0 +1,66 @@
+[project]
+name = "portfolio-delivery"
+version = "0.1.0"
+requires-python = ">=3.13,<3.14"
+dependencies = ["pydantic>=2.12,<3"]
+
+[build-system]
+requires = ["uv_build>=0.8.4,<0.9.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+  "hypothesis>=6.140,<7",
+  "mypy>=1.18,<2",
+  "mutmut>=3.3,<4",
+  "pip-audit>=2.9,<3",
+  "poethepoet>=0.37,<1",
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.2,<2",
+  "pytest-cov>=7,<8",
+  "ruff>=0.13,<1",
+  "xenon>=0.9.3,<1",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+extend-exclude = [".dagger/sdk"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "C901", "B", "UP", "SIM", "N", "RUF", "ASYNC", "S", "PL"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.mypy]
+strict = true
+python_version = "3.13"
+warn_unreachable = true
+disallow_any_explicit = true
+exclude = '^\.dagger/sdk/'
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+omit = [".dagger/sdk/*"]
+
+[tool.mutmut]
+source_paths = ["src/portfolio_delivery"]
+also_copy = ["pyproject.toml"]
+
+[tool.poe.tasks]
+lock-check = "uv lock --check"
+typecheck = "mypy --strict src tests"
+complexity = "xenon --max-absolute A --max-modules A --max-average A src"
+test-unit = "pytest tests/unit"
+test-property = "pytest tests/property"
+test-conformance = "pytest tests/conformance"
+test-dagger = "pytest tests/dagger"
+test = "pytest --cov=src/portfolio_delivery --cov-branch --cov-report=term-missing --cov-fail-under=90"
+mutation = "mutmut run"
+audit = "pip-audit"
+
+[tool.poe.tasks.lint]
+shell = "ruff check --fix . && ruff format ."
