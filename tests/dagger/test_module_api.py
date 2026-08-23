@@ -184,11 +184,11 @@ def live_fixture() -> Path:
     return LIVE_FIXTURE
 
 
-def pipeline_files(tmp_path: Path) -> PipelineFiles:
+def pipeline_files(tmp_path: Path, artifact_bytes: bytes = b"wheel") -> PipelineFiles:
     source = tmp_path / "source"
     artifacts = tmp_path / "outputs"
     sboms = tmp_path / "sboms"
-    _write_pipeline_bytes(source, artifacts, sboms)
+    _write_pipeline_bytes(source, artifacts, sboms, artifact_bytes)
     inventory, digest = _pipeline_inventory(source, tmp_path)
     build_input = _pipeline_document(tmp_path, digest, artifacts, sboms)
     evidence = _pipeline_evidence(tmp_path, digest)
@@ -203,12 +203,14 @@ def pipeline_files(tmp_path: Path) -> PipelineFiles:
     )
 
 
-def _write_pipeline_bytes(source: Path, artifacts: Path, sboms: Path) -> None:
+def _write_pipeline_bytes(
+    source: Path, artifacts: Path, sboms: Path, artifact_bytes: bytes = b"wheel"
+) -> None:
     (source / "src").mkdir(parents=True)
     (artifacts / "artifacts").mkdir(parents=True)
     (sboms / "sbom").mkdir(parents=True)
     (source / "src/app.py").write_bytes(b"app")
-    (artifacts / "artifacts/package.whl").write_bytes(b"wheel")
+    (artifacts / "artifacts/package.whl").write_bytes(artifact_bytes)
     (sboms / "sbom/package.cdx.json").write_bytes(b'{"bomFormat":"CycloneDX"}\n')
 
 

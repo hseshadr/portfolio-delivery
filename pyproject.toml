@@ -41,13 +41,14 @@ select = ["E", "F", "I", "W", "C901", "B", "UP", "SIM", "N", "RUF", "ASYNC", "S"
 "tests/dagger/test_secret_boundary.py" = ["S603"]
 ".dagger/src/portfolio_delivery_dagger/dto.py" = ["RUF009"]
 ".dagger/src/portfolio_delivery_dagger/oras.py" = ["RUF009"]
+"tests/dagger/plan_fixture/src/task_8_plan_fixture/main.py" = ["RUF009"]
 
 [tool.mypy]
 strict = true
 python_version = "3.13"
 warn_unreachable = true
 disallow_any_explicit = true
-exclude = '^(\.dagger/sdk/|tests/dagger/live_fixture/)'
+exclude = '^(\.dagger/sdk/|tests/dagger/(live_fixture|plan_fixture)/)'
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

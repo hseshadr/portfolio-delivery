@@ -25,6 +25,7 @@ from portfolio_delivery_dagger.dto import (
 from portfolio_delivery_dagger.main import PortfolioDelivery, _oras_runner, _scan_directory
 from portfolio_delivery_dagger.oras import (
     DaggerOrasRunner,
+    ProviderObservation,
     QualifiedEnvelopeRef,
     qualified_bundle,
     restored_dto,
@@ -72,6 +73,9 @@ class LiveMetrics:
     second: Metrics
     restore_one: Metrics
     restore_two: Metrics
+    observations: tuple[ProviderObservation, ...]
+    registry_stdout: str
+    registry_stderr: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,9 +140,12 @@ async def _probe(paths: ProbePaths) -> None:
         service = _registry_service()
         secret = _registry_secret(paths.registry_config)
         service = await service.start()
-        document, restored, repeated = await _effects(qualified, service, secret, paths.run_id)
-        await _export_outputs(paths.output, qualified, restored, repeated)
-        sys.stdout.write(json.dumps(asdict(document), sort_keys=True, separators=(",", ":")))
+        try:
+            document, restored, repeated = await _effects(qualified, service, secret, paths.run_id)
+            await _export_outputs(paths.output, qualified, restored, repeated)
+            sys.stdout.write(json.dumps(asdict(document), sort_keys=True, separators=(",", ":")))
+        finally:
+            await service.stop()
     finally:
         await dagger.close()
 
@@ -183,7 +190,54 @@ def _dagger_file(path: Path) -> File:
 
 
 def _registry_service() -> Service:
-    return dag.container().from_(REGISTRY_IMAGE).with_exposed_port(5000).as_service()
+    container = dag.container().from_(REGISTRY_IMAGE)
+    container = container.with_file(
+        "/log-entrypoint", dag.file("entrypoint", _log_entrypoint()), permissions=0o755
+    )
+    container = container.with_file(
+        "/serve-stdout", dag.file("stdout", _log_server("stdout")), permissions=0o755
+    )
+    container = container.with_file(
+        "/serve-stderr", dag.file("stderr", _log_server("stderr")), permissions=0o755
+    )
+    return _exposed_registry(container.with_entrypoint(["/log-entrypoint"]))
+
+
+def _exposed_registry(container: dagger.Container) -> Service:
+    return (
+        container.with_exposed_port(5000)
+        .with_exposed_port(5101)
+        .with_exposed_port(5102)
+        .as_service()
+    )
+
+
+def _log_entrypoint() -> str:
+    return """#!/bin/sh
+set -eu
+mkdir -p /tmp/registry-logs
+: > /tmp/registry-logs/stdout
+: > /tmp/registry-logs/stderr
+busybox nc -lk -p 5101 -e /serve-stdout &
+busybox nc -lk -p 5102 -e /serve-stderr &
+exec /entrypoint.sh /etc/distribution/config.yml \
+  >>/tmp/registry-logs/stdout 2>>/tmp/registry-logs/stderr
+"""
+
+
+def _log_server(name: str) -> str:
+    return f"""#!/bin/sh
+path=/tmp/registry-logs/{name}
+snapshot=/tmp/registry-logs/{name}-$$
+tail -c 32768 "$path" > "$snapshot"
+length=$(wc -c < "$snapshot")
+printf 'HTTP/1.1 200 OK\\r\\n'
+printf 'Content-Type: text/plain\\r\\n'
+printf 'Content-Length: %s\\r\\n' "$length"
+printf 'Connection: close\\r\\n\\r\\n'
+cat "$snapshot"
+rm -f "$snapshot"
+"""
 
 
 def _registry_secret(path: Path | None) -> Secret | None:
@@ -210,7 +264,8 @@ async def _effects(
     repeated, restore_two = await _restore(adapter, runner, first, restore_two_id)
     stored = (first, second)
     metrics = (first_metrics, second_metrics, restore_one, restore_two)
-    document = _metrics_document(stored, metrics)
+    stdout, stderr = await _registry_logs(service)
+    document = _metrics_document(stored, metrics, tuple(runner.observations), stdout, stderr)
     return document, restored, repeated
 
 
@@ -242,6 +297,9 @@ async def _restore(
 def _metrics_document(
     stored: tuple[CoreStoredEnvelope, CoreStoredEnvelope],
     metrics: tuple[Metrics, Metrics, Metrics, Metrics],
+    observations: tuple[ProviderObservation, ...],
+    stdout: str,
+    stderr: str,
 ) -> LiveMetrics:
     first, second = stored
     first_metrics, second_metrics, restore_one, restore_two = metrics
@@ -254,7 +312,22 @@ def _metrics_document(
         second_metrics,
         restore_one,
         restore_two,
+        observations,
+        stdout,
+        stderr,
     )
+
+
+async def _registry_logs(service: Service) -> tuple[str, str]:
+    reader = dag.container().from_(REGISTRY_IMAGE).with_service_binding("registry-logs", service)
+    return await asyncio.gather(_registry_log(reader, 5101), _registry_log(reader, 5102))
+
+
+async def _registry_log(container: dagger.Container, port: int) -> str:
+    request = "printf 'GET / HTTP/1.0\\r\\nHost: registry-logs\\r\\n\\r\\n'"
+    script = f'{request} | busybox nc -w 5 registry-logs "$1"'
+    response = await container.with_exec(["sh", "-c", script, "log-reader", str(port)]).stdout()
+    return response.split("\r\n\r\n", 1)[-1]
 
 
 def _mark(runner: DaggerOrasRunner) -> RunnerMark:

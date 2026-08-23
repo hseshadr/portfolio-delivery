@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -96,6 +97,7 @@ REGISTRY_CONFIG_PATH: Final = "/run/secrets/registry-config.json"
 ATTEMPT_ENV: Final = "PORTFOLIO_DELIVERY_ATTEMPT_ID"
 WORKDIR: Final = "/work"
 CAPTURE_ROOT: Final = "/tmp/portfolio-delivery-run"  # noqa: S108
+RESTORE_ROOT: Final = f"{CAPTURE_ROOT}/restore"
 CORE_INPUT_PATHS: Final = (
     "config.v1.json",
     "build-envelope.v1.json",
@@ -104,9 +106,11 @@ CORE_INPUT_PATHS: Final = (
 TIMEOUT_EXIT_CODE: Final = 124
 DEFAULT_EXECUTION_DEADLINE_SECONDS: Final = 120
 MAX_RESTORE_DESCRIPTORS: Final = 256
-MAX_RESTORE_FILE_BYTES: Final = 4_194_304
-MAX_RESTORE_TOTAL_BYTES: Final = 67_108_864
+MAX_RESTORE_FILE_BYTES: Final = 67_108_864
+MAX_RESTORE_TOTAL_BYTES: Final = 536_870_912
 OUTPUT_CHUNK_BYTES: Final = 1_048_576
+MAX_OBSERVATION_ARGUMENTS: Final = 128
+MAX_OBSERVATION_TEXT_BYTES: Final = 4_096
 CHUNK_READ_SCRIPT: Final = 'dd if="$1" bs="$2" skip="$3" count=1 2>/dev/null | base64'
 DEADLINE_SCRIPT: Final = (
     'deadline="$1"; shift; timeout -s TERM -k 5 "$deadline" "$@"; status=$?; '
@@ -155,11 +159,32 @@ class ProviderExecutionPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class ProviderBindings:
+    registry_config: bool = False
+    registry_service: bool = False
+
+
+NO_PROVIDER_BINDINGS: Final = ProviderBindings()
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderObservation:
     attempt_id: str
     argv: tuple[str, ...]
     environment: tuple[tuple[str, str], ...]
     capture: CapturePaths
+    cache_mounts: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _validate_observation(self)
+
+
+@dataclass(frozen=True, slots=True)
+class EncodedChunk:
+    ordinal: int
+    count: int
+    decoded_length: int
+    encoded: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +193,13 @@ class RetainedRecordBytes:
     qualification: bytes
     snapshot_manifest: bytes
     prequalification_evidence: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedBundleOutputs:
+    bundle: EnvelopeBundle
+    artifacts: FileManifest
+    sboms: FileManifest
 
 
 @dataclass(kw_only=True)
@@ -225,9 +257,7 @@ class DaggerOrasRunner:
     async def run(self, invocation: OrasInvocation, attempt_id: str) -> OrasResult:
         validate_attempt_id(attempt_id)
         await self._start_service()
-        plan = _execution_plan(
-            invocation, attempt_id, self.execution_count + 1, self.execution_deadline_seconds
-        )
+        plan = self._plan(invocation, attempt_id)
         self._record(invocation, plan)
         executed = self._execute(invocation, plan)
         self.previous_container = executed
@@ -239,7 +269,13 @@ class DaggerOrasRunner:
     def _record(self, invocation: OrasInvocation, plan: ProviderExecutionPlan) -> None:
         self.execution_count += 1
         self.observations.append(
-            ProviderObservation(plan.environment[0][1], plan.argv, plan.environment, plan.capture)
+            ProviderObservation(
+                plan.environment[0][1],
+                plan.argv,
+                plan.environment,
+                plan.capture,
+                plan.cache_mounts,
+            )
         )
         if _is_push(invocation.argv):
             self.push_count += 1
@@ -252,15 +288,22 @@ class DaggerOrasRunner:
         await self.registry_service.start()
         self.service_started = True
 
+    def _plan(self, invocation: OrasInvocation, attempt_id: str) -> ProviderExecutionPlan:
+        bindings = ProviderBindings(
+            self.registry_config is not None, self.registry_service is not None
+        )
+        return _execution_plan(
+            invocation,
+            attempt_id,
+            self.execution_count + 1,
+            self.execution_deadline_seconds,
+            bindings,
+        )
+
     def _execute(self, invocation: OrasInvocation, plan: ProviderExecutionPlan) -> Container:
         container = self._configured_container(invocation, plan)
-        argv = _execution_argv(
-            invocation.argv, self.registry_config is not None, self.registry_service is not None
-        )
-        private_argv = _private_output_argv(argv, plan.capture)
-        deadline_argv = _deadline_argv(private_argv, self.execution_deadline_seconds)
         return container.with_env_variable(*plan.environment[0]).with_exec(
-            list(deadline_argv),
+            list(plan.argv),
             redirect_stdout=plan.capture.process_stdout,
             redirect_stderr=plan.capture.stderr,
             expect=ReturnType.ANY,
@@ -357,14 +400,58 @@ def _execution_argv(
 
 
 def _execution_plan(
-    invocation: OrasInvocation, attempt_id: str, ordinal: int, deadline_seconds: int
+    invocation: OrasInvocation,
+    attempt_id: str,
+    ordinal: int,
+    deadline_seconds: int,
+    bindings: ProviderBindings = NO_PROVIDER_BINDINGS,
 ) -> ProviderExecutionPlan:
     validate_attempt_id(attempt_id)
     capture = _capture_paths(ordinal)
-    argv = _private_output_argv(invocation.argv, capture)
+    provider = _execution_argv(invocation.argv, bindings.registry_config, bindings.registry_service)
+    argv = _private_output_argv(provider, capture)
     return ProviderExecutionPlan(
         _deadline_argv(argv, deadline_seconds), ((ATTEMPT_ENV, attempt_id),), capture
     )
+
+
+def _validate_observation(observation: ProviderObservation) -> None:
+    _validate_observation_argv(observation.argv)
+    _validate_observation_text(observation)
+    _validate_observation_state(observation)
+    _validate_capture_observation(observation.capture)
+
+
+def _validate_observation_argv(argv: tuple[str, ...]) -> None:
+    if not argv or len(argv) > MAX_OBSERVATION_ARGUMENTS:
+        raise InvalidIdentity("provider observation argument count is outside its bound")
+
+
+def _validate_observation_text(observation: ProviderObservation) -> None:
+    texts = (*observation.argv, *(item for pair in observation.environment for item in pair))
+    if any(len(item.encode()) > MAX_OBSERVATION_TEXT_BYTES for item in texts):
+        raise InvalidIdentity("provider observation text exceeds its byte bound")
+
+
+def _validate_observation_state(observation: ProviderObservation) -> None:
+    if observation.environment != ((ATTEMPT_ENV, observation.attempt_id),):
+        raise InvalidIdentity("provider observation must retain only the regular attempt variable")
+    if observation.cache_mounts:
+        raise InvalidIdentity("provider observation must not contain cache mounts")
+
+
+def _validate_capture_observation(capture: CapturePaths) -> None:
+    paths = (
+        capture.directory,
+        capture.stdout,
+        capture.process_stdout,
+        capture.stderr,
+        capture.manifest,
+    )
+    if any(not item.startswith(f"{CAPTURE_ROOT}/") for item in paths):
+        raise InvalidIdentity("provider observation capture escaped its private namespace")
+    if any(len(item.encode()) > MAX_OBSERVATION_TEXT_BYTES for item in paths):
+        raise InvalidIdentity("provider observation capture path exceeds its byte bound")
 
 
 def _capture_paths(ordinal: int) -> CapturePaths:
@@ -537,29 +624,30 @@ def _validate_restore_manifest(content: bytes) -> None:
 
 def _require_restore_descriptor_bounds(descriptors: tuple[_RestoreDescriptor, ...]) -> None:
     sizes = tuple(item.size for item in descriptors)
-    _require_descriptor_count(sizes)
-    _require_file_sizes(sizes)
-    _require_total_size(sizes)
+    message = _layer_bound_error(sizes)
+    if message is not None:
+        raise MalformedProviderResponse(message)
 
 
-def _require_descriptor_count(sizes: tuple[int, ...]) -> None:
+def _layer_bound_error(sizes: tuple[int, ...]) -> str | None:
     if len(sizes) > MAX_RESTORE_DESCRIPTORS:
-        raise MalformedProviderResponse("OCI manifest exceeds its descriptor count bound")
-
-
-def _require_file_sizes(sizes: tuple[int, ...]) -> None:
+        return "OCI layer set exceeds its descriptor count bound"
     if any(size > MAX_RESTORE_FILE_BYTES for size in sizes):
-        raise MalformedProviderResponse("OCI descriptor exceeds its per-file byte bound")
-
-
-def _require_total_size(sizes: tuple[int, ...]) -> None:
+        return "OCI layer exceeds its per-file byte bound"
     if sum(sizes) > MAX_RESTORE_TOTAL_BYTES:
-        raise MalformedProviderResponse("OCI manifest exceeds its aggregate restored-byte bound")
+        return "OCI layer set exceeds its aggregate byte bound"
+    return None
 
 
 async def qualified_bundle(
     bundle: DaggerQualifiedEnvelope, scanner: DirectoryScanner
 ) -> EnvelopeBundle:
+    return (await _qualified_bundle_outputs(bundle, scanner)).bundle
+
+
+async def _qualified_bundle_outputs(
+    bundle: DaggerQualifiedEnvelope, scanner: DirectoryScanner
+) -> ValidatedBundleOutputs:
     records = await _validated_record_bytes(bundle)
     payload = parse_bounded_json(records.envelope, MAX_MANIFEST_BYTES)
     document = BuildEnvelopeDocument.model_validate(payload)
@@ -567,10 +655,11 @@ async def qualified_bundle(
         parse_bounded_json(records.qualification, MAX_MANIFEST_BYTES)
     )
     _validate_retained_provenance(records, document)
-    await _validate_output_directories(bundle, document, scanner)
-    return _reconstruct_bundle(
+    manifests = await _validate_output_directories(bundle, document, scanner)
+    core = _reconstruct_bundle(
         bundle, document, qualification, records.envelope, records.qualification
     )
+    return ValidatedBundleOutputs(core, *manifests)
 
 
 async def _validated_record_bytes(bundle: DaggerQualifiedEnvelope) -> RetainedRecordBytes:
@@ -614,11 +703,12 @@ async def _validate_output_directories(
     bundle: DaggerQualifiedEnvelope,
     document: BuildEnvelopeDocument,
     scanner: DirectoryScanner,
-) -> None:
+) -> tuple[FileManifest, FileManifest]:
     artifacts = await scanner(bundle.artifacts)
     sboms = await scanner(bundle.sboms)
     _require_artifact_records(artifacts, document)
     _require_sbom_records(sboms, document)
+    return artifacts, sboms
 
 
 def _require_artifact_records(manifest: FileManifest, document: BuildEnvelopeDocument) -> None:
@@ -778,10 +868,24 @@ async def persist_qualified_bundle(
     repository: str,
     attempt_id: str,
 ) -> StoredEnvelope:
-    core = await qualified_bundle(bundle, scanner)
-    runner = runner_factory(core)
-    stored = await OrasAdapter(runner, repository).persist(core, attempt_id)
+    validated = await _qualified_bundle_outputs(bundle, scanner)
+    runner = runner_factory(validated.bundle)
+    adapter = OrasAdapter(runner, repository)
+    _require_persist_layer_bounds(validated, adapter)
+    stored = await adapter.persist(validated.bundle, attempt_id)
     return stored_dto(stored, cast(DaggerOrasRunner, runner))
+
+
+def _require_persist_layer_bounds(validated: ValidatedBundleOutputs, adapter: OrasAdapter) -> None:
+    invocation = adapter.plan_push(validated.bundle)
+    output_records = (*validated.artifacts.files, *validated.sboms.files)
+    sizes = (
+        *tuple(len(item) for item in invocation.input_bytes),
+        *(item.size for item in output_records),
+    )
+    message = _layer_bound_error(sizes)
+    if message is not None:
+        raise InvalidIdentity(message)
 
 
 def stored_dto(stored: CoreStoredEnvelope, runner: DaggerOrasRunner) -> StoredEnvelope:
@@ -817,9 +921,17 @@ def _restored_ref(
         release_id=release,
         envelope_uri=uri,
         envelope_digest=digest,
-        envelope=_bytes_file(client, "build-envelope.v1.json", qualified.envelope.canonical_bytes),
+        envelope=_bytes_file(
+            client,
+            "build-envelope.v1.json",
+            qualified.envelope.canonical_bytes,
+            qualified.envelope.content_sha256.value,
+        ),
         qualification=_bytes_file(
-            client, "qualification-record.v1.json", qualified.qualification.canonical_bytes
+            client,
+            "qualification-record.v1.json",
+            qualified.qualification.canonical_bytes,
+            qualified.qualification.content_sha256.value,
         ),
         artifacts=_record_directory(client, runner, bundle, artifacts=True),
         sboms=_record_directory(client, runner, bundle, artifacts=False),
@@ -842,7 +954,9 @@ def _record_directory(
     for record in records:
         path = record.path.value
         content = _restored_content(runner, record.sha256.value)
-        directory = directory.with_file(path, _bytes_file(client, path, content))
+        directory = directory.with_file(
+            path, _bytes_file(client, path, content, record.sha256.value)
+        )
     return directory
 
 
@@ -854,16 +968,79 @@ def _restored_content(runner: DaggerOrasRunner, digest: str) -> bytes:
         raise InvalidIdentity("restored provider blob bytes were not retained") from error
 
 
-def _bytes_file(client: Client, name: str, content: bytes) -> File:
-    encoded = base64.b64encode(content).decode()
-    source = client.file(f"{PurePosixPath(name).name}.base64", encoded)
-    return (
-        client.container()
-        .from_(ORAS_IMAGE)
-        .with_mounted_file("/input.base64", source)
-        .with_exec(["base64", "-d", "/input.base64"], redirect_stdout="/output")
-        .file("/output")
+def _bytes_file(client: Client, name: str, content: bytes, digest: str) -> File:
+    chunks = _encoded_chunks(content, digest)
+    if not chunks:
+        return client.file(PurePosixPath(name).name, "")
+    container = _empty_restore_container(client)
+    for chunk in chunks:
+        container = _append_encoded_chunk(client, container, chunk)
+    return container.file(f"{RESTORE_ROOT}/output")
+
+
+def _encoded_chunks(content: bytes, digest: str) -> tuple[EncodedChunk, ...]:
+    _require_restored_digest(content, digest)
+    pieces = tuple(
+        content[offset : offset + OUTPUT_CHUNK_BYTES]
+        for offset in range(0, len(content), OUTPUT_CHUNK_BYTES)
     )
+    count = len(pieces)
+    chunks = tuple(_encoded_chunk(item, ordinal, count) for ordinal, item in enumerate(pieces))
+    _validate_encoded_chunks(chunks, content, digest)
+    return chunks
+
+
+def _encoded_chunk(content: bytes, ordinal: int, count: int) -> EncodedChunk:
+    return EncodedChunk(ordinal, count, len(content), base64.b64encode(content).decode("ascii"))
+
+
+def _validate_encoded_chunks(chunks: tuple[EncodedChunk, ...], content: bytes, digest: str) -> None:
+    _validate_chunk_sequence(chunks)
+    _validate_chunk_contents(chunks, content)
+    _require_restored_digest(content, digest)
+
+
+def _validate_chunk_sequence(chunks: tuple[EncodedChunk, ...]) -> None:
+    expected = tuple(range(len(chunks)))
+    if tuple(item.ordinal for item in chunks) != expected:
+        raise InvalidIdentity("restored transfer chunk ordinals were not contiguous")
+    if any(item.count != len(chunks) for item in chunks):
+        raise InvalidIdentity("restored transfer chunk count was inconsistent")
+
+
+def _validate_chunk_contents(chunks: tuple[EncodedChunk, ...], content: bytes) -> None:
+    for item in chunks:
+        start = item.ordinal * OUTPUT_CHUNK_BYTES
+        if _decoded_chunk(item) != content[start : start + item.decoded_length]:
+            raise InvalidIdentity("restored transfer chunks changed provider bytes")
+
+
+def _decoded_chunk(chunk: EncodedChunk) -> bytes:
+    try:
+        decoded = base64.b64decode(chunk.encoded, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise InvalidIdentity("restored transfer chunk encoding was malformed") from error
+    if len(decoded) != chunk.decoded_length or len(decoded) > OUTPUT_CHUNK_BYTES:
+        raise InvalidIdentity("restored transfer chunk length was invalid")
+    return decoded
+
+
+def _require_restored_digest(content: bytes, digest: str) -> None:
+    if Sha256Digest.from_bytes(content).value != Sha256Digest(digest).value:
+        raise InvalidIdentity("restored transfer bytes differ from their descriptor digest")
+
+
+def _empty_restore_container(client: Client) -> Container:
+    output = f"{RESTORE_ROOT}/output"
+    command = ["sh", "-c", 'mkdir -p "$1"; : > "$2"', "init", RESTORE_ROOT, output]
+    return client.container().from_(ORAS_IMAGE).with_exec(command)
+
+
+def _append_encoded_chunk(client: Client, container: Container, chunk: EncodedChunk) -> Container:
+    path = f"{RESTORE_ROOT}/chunk-{chunk.ordinal}.base64"
+    source = client.file(f"chunk-{chunk.ordinal}.base64", chunk.encoded)
+    command = ["sh", "-c", 'base64 -d "$1" >> "$2"', "append", path, f"{RESTORE_ROOT}/output"]
+    return container.with_mounted_file(path, source).with_exec(command)
 
 
 def parse_reference(envelope_uri: str, envelope_digest: str) -> OciReference:

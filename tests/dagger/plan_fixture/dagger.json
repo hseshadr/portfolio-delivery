@@ -1,5 +1,5 @@
 {
-  "name": "task7-live-fixture",
+  "name": "task8-plan-fixture",
   "engineVersion": "v0.21.8",
   "sdk": {
     "source": "python"
@@ -8,10 +8,6 @@
     {
       "name": "portfolio-delivery",
       "source": "../../.."
-    },
-    {
-      "name": "task8-plan-fixture",
-      "source": "../plan_fixture"
     }
   ]
 }

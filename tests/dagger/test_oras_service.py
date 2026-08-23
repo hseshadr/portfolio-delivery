@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 import secrets
 import subprocess
+import tomllib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -20,12 +23,13 @@ from portfolio_delivery_dagger.inventory import (
     FileRecord,
     PrequalificationEvidenceDocument,
 )
-from portfolio_delivery_dagger.oras import ORAS_IMAGE, DaggerOrasRunner
+from portfolio_delivery_dagger.oras import ATTEMPT_ENV, ORAS_IMAGE, DaggerOrasRunner
 from pydantic import BaseModel, ConfigDict
 
 from portfolio_delivery.adapters.oras import MalformedProviderResponse
+from portfolio_delivery.domain.artifacts import Artifact, Sbom
 from portfolio_delivery.domain.errors import InvalidIdentity
-from portfolio_delivery.domain.identity import Sha256Digest
+from portfolio_delivery.domain.identity import ArtifactPath, Sha256Digest
 from portfolio_delivery.domain.stages import (
     EnvelopeBundle,
     OrasInvocation,
@@ -41,7 +45,12 @@ from tests.dagger.test_module_api import (
     dagger_cli,
     pipeline_files,
 )
-from tests.unit.adapters.test_oras import SBOM_BYTES, make_bundle
+from tests.unit.adapters.test_oras import (
+    SBOM_BYTES,
+    make_bundle,
+    make_bundle_from,
+    make_sbom,
+)
 
 EXPECTED_ORAS_IMAGE: Final = (
     "ghcr.io/oras-project/oras@sha256:"
@@ -50,7 +59,13 @@ EXPECTED_ORAS_IMAGE: Final = (
 REGISTRY_IMAGE: Final = (
     "registry:3.0.0@sha256:6c5666b861f3505b116bb9aa9b25175e71210414bd010d92035ff64018f9457e"
 )
+PYTHON_IMAGE: Final = (
+    "python:3.13.14-slim@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe9cc1a0c0125e6"
+)
+PLAN_FIXTURE: Final = ROOT / "tests/dagger/plan_fixture"
 MIB: Final = 1_048_576
+FIVE_CHUNKS: Final = 5
+MINIMUM_MANIFEST_READS: Final = 4
 PRIVATE_CAPTURE_PREFIX: Final = "/tmp/portfolio-delivery-run/"  # noqa: S108
 type Scanner = Callable[[Directory], Awaitable[FileManifest]]
 
@@ -63,15 +78,51 @@ class ProviderMetricsDocument(BaseModel):  # type: ignore[explicit-any]
     attempt_ids: tuple[str, ...]
 
 
-class LiveMetricsDocument(BaseModel):  # type: ignore[explicit-any]
+class ProviderLifecycleDocument(BaseModel):  # type: ignore[explicit-any]
     model_config = ConfigDict(frozen=True, extra="forbid")
-    envelope_uri: str
-    first_digest: str
-    second_digest: str
     first: ProviderMetricsDocument
     second: ProviderMetricsDocument
     restore_one: ProviderMetricsDocument
     restore_two: ProviderMetricsDocument
+
+
+class CapturePathsDocument(BaseModel):  # type: ignore[explicit-any]
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    directory: str
+    stdout: str
+    process_stdout: str
+    stderr: str
+    manifest: str
+
+
+class ProviderObservationDocument(BaseModel):  # type: ignore[explicit-any]
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    attempt_id: str
+    argv: tuple[str, ...]
+    environment: tuple[tuple[str, str], ...]
+    capture: CapturePathsDocument
+    cache_mounts: tuple[str, ...]
+
+
+class LiveMetricsDocument(ProviderLifecycleDocument):  # type: ignore[explicit-any]
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    envelope_uri: str
+    first_digest: str
+    second_digest: str
+    observations: tuple[ProviderObservationDocument, ...]
+    registry_stdout: str
+    registry_stderr: str
+
+
+class PublicSmokeDocument(ProviderLifecycleDocument):  # type: ignore[explicit-any]
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    envelope_uri: str
+    first_digest: str
+    second_digest: str
+    exact_bytes: bool
+    object_ids: tuple[str, ...]
+    registry_stdout: str
+    registry_stderr: str
 
 
 @pytest.fixture(scope="session")
@@ -83,6 +134,15 @@ def live_fixture() -> Path:
 def test_should_pin_only_reviewed_oras_image() -> None:
     # When / Then
     assert ORAS_IMAGE == EXPECTED_ORAS_IMAGE
+
+
+def test_should_pin_plan_fixture_python_runtime() -> None:
+    # Given / When
+    config = tomllib.loads((PLAN_FIXTURE / "pyproject.toml").read_text())
+
+    # Then
+    assert config["project"]["requires-python"] == ">=3.13,<3.14"
+    assert config["tool"]["dagger"]["base-image"] == PYTHON_IMAGE
 
 
 @pytest.mark.parametrize(
@@ -189,6 +249,34 @@ def test_should_keep_capture_files_private_when_user_layer_names_collide(collisi
     assert plan.argv[plan.argv.index("--export-manifest") + 1] == plan.capture.manifest
 
 
+def test_should_record_exact_finalized_provider_execution_surfaces() -> None:
+    # When
+    result = subprocess.run(
+        _dagger_python_command("tests/dagger/secret_observation_probe.py"),
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    # Then
+    assert result.returncode == 0, result.stderr
+
+
+def _dagger_python_command(script: str) -> list[str]:
+    return [
+        dagger_cli(),
+        "-s",
+        "run",
+        "env",
+        "PYTHONPATH=.:.dagger/src",
+        "uv",
+        "run",
+        "python",
+        script,
+    ]
+
+
 def _collision_invocation(collision: str) -> OrasInvocation:
     return OrasInvocation(
         (
@@ -213,17 +301,78 @@ def _restore_manifest(layer_count: int, sizes: tuple[int, ...]) -> bytes:
 
 
 @pytest.mark.parametrize(
+    "sizes",
+    (
+        pytest.param((5 * MIB,), id="five-mib"),
+        pytest.param((64 * MIB,), id="exact-file"),
+        pytest.param((64 * MIB,) * 8, id="exact-aggregate"),
+    ),
+)
+def test_should_accept_symmetric_layer_budget_before_blob_fetch(sizes: tuple[int, ...]) -> None:
+    # When / Then
+    oras_runtime._validate_restore_manifest(_restore_manifest(len(sizes), sizes))
+
+
+@pytest.mark.parametrize(
     "manifest",
     (
         pytest.param(_restore_manifest(257, (1,)), id="layer-count"),
-        pytest.param(_restore_manifest(2, (5 * MIB,)), id="per-file-bridge"),
-        pytest.param(_restore_manifest(2, (33 * MIB, 32 * MIB)), id="aggregate"),
+        pytest.param(_restore_manifest(1, (64 * MIB + 1,)), id="file-plus-one"),
+        pytest.param(_restore_manifest(9, (64 * MIB,) * 8 + (1,)), id="aggregate-plus-one"),
     ),
 )
-def test_should_reject_unbounded_restore_plan_before_blob_fetch(manifest: bytes) -> None:
+def test_should_reject_layer_budget_overflow_before_blob_fetch(manifest: bytes) -> None:
     # When / Then
     with pytest.raises(MalformedProviderResponse):
         oras_runtime._validate_restore_manifest(manifest)
+
+
+@pytest.mark.parametrize("sizes", ((64 * MIB + 1,), (64 * MIB,) * 8))
+async def test_should_reject_persist_when_restore_would_reject(sizes: tuple[int, ...]) -> None:
+    # Given
+    bundle = _sized_bundle(sizes)
+    dto, scanner = _exact_dagger_bundle(bundle)
+    runner = RecordingRunner()
+
+    # When / Then
+    with pytest.raises(InvalidIdentity, match="layer"):
+        await oras_runtime.persist_qualified_bundle(
+            dto, scanner, lambda _: runner, "registry.example/repo", "attempt-budget"
+        )
+    assert runner.invocations == []
+
+
+def test_should_encode_restored_file_as_validated_one_mib_chunks() -> None:
+    # Given
+    content = b"x" * (5 * MIB)
+    digest = Sha256Digest.from_bytes(content).value
+
+    # When
+    chunks = oras_runtime._encoded_chunks(content, digest)
+
+    # Then
+    assert tuple(item.ordinal for item in chunks) == tuple(range(FIVE_CHUNKS))
+    assert all(item.count == FIVE_CHUNKS and item.decoded_length == MIB for item in chunks)
+
+
+def _sized_bundle(sizes: tuple[int, ...]) -> EnvelopeBundle:
+    base = make_bundle().artifacts[0]
+    artifacts = tuple(
+        replace(
+            base,
+            name=f"package-{index}",
+            path=ArtifactPath(f"artifacts/package-{index}.whl"),
+            size=size,
+        )
+        for index, size in enumerate(sizes)
+    )
+    sboms = tuple(_sized_sbom(item, index) for index, item in enumerate(artifacts))
+    return make_bundle_from(artifacts, sboms)
+
+
+def _sized_sbom(artifact: Artifact, index: int) -> Sbom:
+    sbom = make_sbom(artifact)
+    return replace(sbom, path=ArtifactPath(f"sbom/package-{index}.cdx.json"))
 
 
 @pytest.mark.parametrize(
@@ -361,6 +510,67 @@ def test_should_reconcile_and_restore_exact_bytes_with_empty_cache(
     _assert_live_result(result.stdout, outputs)
 
 
+def test_should_execute_public_root_oci_lifecycle_with_one_service(
+    tmp_path: Path, live_fixture: Path
+) -> None:
+    # Given
+    artifact = b"public-smoke" * ((5 * MIB // len(b"public-smoke")) + 1)
+    files = pipeline_files(tmp_path, artifact[: 5 * MIB])
+    canary = "task8-secret-canary-" + secrets.token_hex(12)
+
+    # When
+    result = _run_public_smoke(files, live_fixture, canary)
+
+    # Then
+    assert result.returncode == 0, result.stderr
+    document = PublicSmokeDocument.model_validate_json(result.stdout)
+    assert document.exact_bytes
+    assert document.first_digest == document.second_digest
+    assert all(document.object_ids)
+    _assert_provider_metrics(document)
+    _assert_attempt_ids(document)
+    _assert_registry_manifest_traffic(document.registry_stdout, document.registry_stderr)
+    assert canary not in result.stdout + result.stderr
+
+
+def _run_public_smoke(
+    files: PipelineFiles, _: Path, canary: str
+) -> subprocess.CompletedProcess[str]:
+    config = json.dumps({"auths": {}, "credHelpers": {"unused.invalid": canary}})
+    environment = {**dict(os.environ), "TASK8_REGISTRY_CONFIG": config}
+    command = [
+        dagger_cli(),
+        "-d",
+        "--progress=plain",
+        "call",
+        "public-oras-smoke",
+        f"--source={files.source}",
+        f"--inventory={files.inventory}",
+        f"--build-input={files.build_input}",
+        f"--artifacts={files.artifacts}",
+        f"--sboms={files.sboms}",
+        f"--prequalification-evidence={files.evidence}",
+        "--registry-config=env:TASK8_REGISTRY_CONFIG",
+        f"--run-id={secrets.token_hex(12)}",
+        "contents",
+    ]
+    return subprocess.run(
+        command,
+        cwd=LIVE_FIXTURE,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _assert_registry_manifest_traffic(stdout: str, stderr: str) -> None:
+    combined = stdout + "\n" + stderr
+    methods = re.findall(r'\] "(GET|HEAD|PUT) /v2/[^" ]+/manifests/', combined)
+    assert methods.count("PUT") == 1
+    assert methods.count("GET") + methods.count("HEAD") >= MINIMUM_MANIFEST_READS
+
+
 @dataclass(frozen=True, slots=True)
 class RestoredOutputs:
     original_envelope: Path
@@ -479,6 +689,8 @@ def _assert_live_result(stdout: str, outputs: RestoredOutputs) -> None:
     assert (outputs.sboms / "sbom/package.cdx.json").read_bytes() == b'{"bomFormat":"CycloneDX"}\n'
     _assert_provider_metrics(metrics)
     _assert_attempt_ids(metrics)
+    _assert_observation_surfaces(metrics.observations)
+    _assert_registry_manifest_traffic(metrics.registry_stdout, metrics.registry_stderr)
 
 
 def _directory_bytes(path: Path) -> tuple[tuple[str, bytes], ...]:
@@ -489,7 +701,7 @@ def _directory_bytes(path: Path) -> tuple[tuple[str, bytes], ...]:
     )
 
 
-def _assert_provider_metrics(metrics: LiveMetricsDocument) -> None:
+def _assert_provider_metrics(metrics: ProviderLifecycleDocument) -> None:
     first = metrics.first
     second = metrics.second
     assert first.execution_count == first.inspection_count + first.push_count
@@ -505,7 +717,7 @@ def _assert_provider_metrics(metrics: LiveMetricsDocument) -> None:
     )
 
 
-def _assert_attempt_ids(metrics: LiveMetricsDocument) -> None:
+def _assert_attempt_ids(metrics: ProviderLifecycleDocument) -> None:
     expected = (
         (metrics.first.attempt_ids, "attempt-one-"),
         (metrics.second.attempt_ids, "attempt-two-"),
@@ -514,6 +726,15 @@ def _assert_attempt_ids(metrics: LiveMetricsDocument) -> None:
     )
     values = tuple(_single_attempt(attempts, prefix) for attempts, prefix in expected)
     assert len(set(values)) == len(values)
+
+
+def _assert_observation_surfaces(observations: tuple[ProviderObservationDocument, ...]) -> None:
+    assert observations
+    for observation in observations:
+        assert observation.environment == ((ATTEMPT_ENV, observation.attempt_id),)
+        assert observation.cache_mounts == ()
+        assert observation.argv[:3] == ("/bin/sh", "-c", oras_runtime.DEADLINE_SCRIPT)
+        assert observation.capture.directory.startswith(PRIVATE_CAPTURE_PREFIX)
 
 
 def _single_attempt(attempts: tuple[str, ...], prefix: str) -> str:
