@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -30,6 +31,7 @@ FIXTURE = ROOT / "tests/fixtures/envelope/input"
 WHEEL = FIXTURE / "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl"
 SBOM = FIXTURE / "sbom/package.cdx.json"
 BUILD_INPUT = FIXTURE / "build-input.json"
+README = ROOT / "README.md"
 PROJECT_NAME = "portfolio-delivery"
 PROJECT_VERSION = "0.1.0"
 SOURCE_DATE_EPOCH = "1724472000"
@@ -70,6 +72,26 @@ def test_should_contain_real_portfolio_delivery_wheel_metadata() -> None:
     # Then
     assert (name, version) == (PROJECT_NAME, PROJECT_VERSION)
     assert "Tag: py3-none-any" in wheel_text
+
+
+def test_should_publish_complete_project_metadata_in_wheel() -> None:
+    # Given / When
+    with zipfile.ZipFile(WHEEL) as wheel:
+        metadata_path = _single_metadata_path(_wheel_names(wheel), "METADATA")
+        metadata = BytesParser(policy=default).parsebytes(wheel.read(metadata_path))
+
+    # Then
+    assert metadata["Summary"] == "Deterministic, policy-gated software delivery envelopes"
+    assert metadata["Author-email"] == "Harish Seshadri <harish.seshadri@gmail.com>"
+    assert metadata["License-Expression"] == "MIT"
+    project_urls = metadata.get_all("Project-URL")
+    assert project_urls is not None
+    assert set(project_urls) == {
+        "Homepage, https://github.com/hseshadr/portfolio-delivery",
+        "Issues, https://github.com/hseshadr/portfolio-delivery/issues",
+        "Repository, https://github.com/hseshadr/portfolio-delivery",
+    }
+    assert metadata["Description-Content-Type"] == "text/markdown"
 
 
 def test_should_use_installer_accepted_wheel_filename() -> None:
@@ -120,6 +142,8 @@ def test_should_contain_only_safe_non_symlink_wheel_paths() -> None:
 def _build_context(destination: Path) -> None:
     destination.mkdir()
     shutil.copy2(ROOT / "pyproject.toml", destination / "pyproject.toml")
+    shutil.copy2(ROOT / "README.md", destination / "README.md")
+    shutil.copy2(ROOT / "LICENSE", destination / "LICENSE")
     shutil.copytree(ROOT / "src", destination / "src")
 
 
@@ -226,3 +250,24 @@ def test_should_bind_sbom_component_to_wheel_and_build_input() -> None:
     assert hashes == [{"alg": "SHA-256", "content": sha256}]
     assert package["sha256"] == f"sha256:{sha256}"
     assert package["size"] == WHEEL.stat().st_size
+
+
+def test_should_map_every_shipped_source_file_once_in_readme() -> None:
+    # Given
+    shipped = tuple(ROOT / path for path in ("src/portfolio_delivery", ".dagger/src"))
+    expected = {str(path.relative_to(ROOT)) for root in shipped for path in root.rglob("*.py")}
+
+    # When
+    content = README.read_text(encoding="utf-8")
+    section = content.split("## Source tree map", 1)[1].split("\n## ", 1)[0]
+    documented = re.findall(r"^- `([^`]+\.py)` —", section, flags=re.MULTILINE)
+
+    # Then
+    assert set(documented) == expected
+    assert len(documented) == len(expected)
+
+
+def test_should_state_hosted_ci_is_unshipped_phase_three_scope() -> None:
+    content = README.read_text(encoding="utf-8")
+
+    assert "Hosted CI is not shipped in Phase 1; it belongs to Phase 3." in content

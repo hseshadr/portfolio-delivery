@@ -39,6 +39,37 @@ GitHub remains the control plane for protected events, OIDC, concurrency, attest
 deployment status. The Dagger graph is the execution and artifact plane. Project behavior enters
 through narrow contracts and composed adapters, so adding another project does not fork the core.
 
+## Source tree map
+
+Every shipped Python source has one responsibility:
+
+- `src/portfolio_delivery/__init__.py` — package boundary and public version.
+- `src/portfolio_delivery/adapters/__init__.py` — provider-adapter namespace.
+- `src/portfolio_delivery/adapters/oras.py` — pure ORAS planning, reconciliation, and restore.
+- `src/portfolio_delivery/application/__init__.py` — application-service namespace.
+- `src/portfolio_delivery/application/foundation.py` — composed release lifecycle service.
+- `src/portfolio_delivery/contracts/__init__.py` — typed-contract namespace.
+- `src/portfolio_delivery/contracts/build.py` — project build and check ports.
+- `src/portfolio_delivery/contracts/oci.py` — shared OCI resource policy.
+- `src/portfolio_delivery/contracts/release.py` — source and release authority ports.
+- `src/portfolio_delivery/contracts/storage.py` — storage and ORAS runner ports.
+- `src/portfolio_delivery/domain/__init__.py` — domain namespace.
+- `src/portfolio_delivery/domain/artifacts.py` — artifacts, SBOMs, locks, and evidence records.
+- `src/portfolio_delivery/domain/errors.py` — concrete domain failures.
+- `src/portfolio_delivery/domain/identity.py` — canonical paths, digests, and release identities.
+- `src/portfolio_delivery/domain/stages.py` — immutable release-stage graph.
+- `src/portfolio_delivery/envelope/__init__.py` — envelope namespace.
+- `src/portfolio_delivery/envelope/builder.py` — envelope and qualification builders.
+- `src/portfolio_delivery/envelope/canonical.py` — bounded canonical JSON.
+- `src/portfolio_delivery/envelope/documents.py` — closed-world boundary documents.
+- `.dagger/src/portfolio_delivery_dagger/__init__.py` — generated Dagger module entrypoint.
+- `.dagger/src/portfolio_delivery_dagger/dto.py` — Dagger-facing transfer objects.
+- `.dagger/src/portfolio_delivery_dagger/interfaces.py` — project composition interfaces.
+- `.dagger/src/portfolio_delivery_dagger/inventory.py` — bounded file inventory documents.
+- `.dagger/src/portfolio_delivery_dagger/main.py` — public Dagger lifecycle functions.
+- `.dagger/src/portfolio_delivery_dagger/oras.py` — container-backed ORAS runner adapter.
+- `.dagger/src/portfolio_delivery_dagger/plan.py` — immutable direct-plan adapter.
+
 ## Prerequisites and exact pins
 
 - Python `3.13.14` and `uv` on `PATH`; wheels use the exact `uv_build==0.8.24` backend.
@@ -131,6 +162,7 @@ uv run poe typecheck
 uv run poe complexity
 uv run poe test
 uv run poe mutation
+uv run poe benchmark-oci-limits
 uv run poe audit
 ```
 
@@ -139,6 +171,11 @@ The mutation task scopes mutations to `domain`, `envelope`, and the pure ORAS ad
 segfaulted, or interrupted mutations. Pure `domain`, `contracts`, `envelope`, and `application`
 modules are also imported in an isolated process with Dagger, provider, network, process, socket,
 and filesystem delivery dependencies blocked.
+
+The metadata-only benchmark evaluates the exact shared limit—256 descriptors, 64 MiB per file,
+and 512 MiB total—without allocating artifact payloads. It prints bounded JSON with cold and warm
+p50/p95 timings; tests validate the scenario and output schema without imposing machine-dependent
+timing thresholds.
 
 ## Phase 1 limitations
 
@@ -152,3 +189,5 @@ Phase 1 deliberately stops at a qualified, locally persisted OCI envelope:
 Those control-plane and project-migration capabilities belong to later phases. The approved full
 architecture is in
 [`docs/superpowers/specs/2026-08-22-portfolio-delivery-design.md`](docs/superpowers/specs/2026-08-22-portfolio-delivery-design.md).
+Hosted CI is not shipped in Phase 1; it belongs to Phase 3. This repository intentionally does not
+add an ad-hoc workflow before that control-plane design is implemented.

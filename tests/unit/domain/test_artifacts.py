@@ -14,6 +14,8 @@ from portfolio_delivery.domain.artifacts import (
 from portfolio_delivery.domain.errors import DuplicateArtifact, InvalidIdentity
 from portfolio_delivery.domain.identity import ArtifactPath, Sha256Digest
 
+ARTIFACT_SIZE = 42
+
 
 def make_digest(character: str) -> Sha256Digest:
     return Sha256Digest(f"sha256:{character * 64}")
@@ -24,7 +26,7 @@ def make_artifact(path: str = "dist/package.whl") -> Artifact:
         name="package",
         path=ArtifactPath(path),
         media_type="application/zip",
-        size=42,
+        size=ARTIFACT_SIZE,
         sha256=make_digest("a"),
     )
 
@@ -85,12 +87,14 @@ def test_should_preserve_explicit_artifact_metadata_when_sbom_is_created() -> No
         artifact_path=artifact.path,
         path=ArtifactPath("sbom/package.cdx.json"),
         media_type="application/vnd.cyclonedx+json",
+        size=42,
         sha256=make_digest("b"),
     )
 
     # Then
     assert sbom.artifact_path == artifact.path
     assert sbom.path.value == "sbom/package.cdx.json"
+    assert sbom.size == ARTIFACT_SIZE
 
 
 def test_should_preserve_exact_lock_and_toolchain_identities_when_created() -> None:
@@ -130,7 +134,7 @@ def test_should_reject_forged_nested_identities_when_sbom_is_created(
 ) -> None:
     # Given / When / Then
     with pytest.raises(InvalidIdentity):
-        Sbom(artifact_path, path, "application/vnd.cyclonedx+json", sha256)
+        Sbom(artifact_path, path, "application/vnd.cyclonedx+json", 42, sha256)
 
 
 @pytest.mark.parametrize(

@@ -15,6 +15,7 @@ from typing import Final, Literal, NoReturn, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from portfolio_delivery.contracts.oci import DEFAULT_OCI_RESOURCE_LIMITS, OciResourceLimits
 from portfolio_delivery.contracts.storage import OrasRunner
 from portfolio_delivery.domain.artifacts import (
     Artifact,
@@ -24,7 +25,7 @@ from portfolio_delivery.domain.artifacts import (
     Sbom,
     ToolchainIdentity,
 )
-from portfolio_delivery.domain.errors import diagnostic_error
+from portfolio_delivery.domain.errors import InvalidIdentity, diagnostic_error
 from portfolio_delivery.domain.identity import (
     ArtifactPath,
     ProjectId,
@@ -85,7 +86,6 @@ MAX_REPOSITORY_LENGTH: Final[int] = 255
 MAX_TAG_LENGTH: Final[int] = 128
 MAX_PATH_LENGTH: Final[int] = 4_096
 MAX_MEDIA_TYPE_LENGTH: Final[int] = 255
-MAX_BLOB_BYTES: Final[int] = 1_073_741_824
 MAX_PROCESS_STDOUT_BYTES: Final[int] = 65_536
 REQUIRED_CORE_LAYERS: Final[int] = 2
 _REPOSITORY: Final = re.compile(
@@ -209,6 +209,9 @@ _BLOB_DIGEST_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
 _BLOB_BOUND_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
     "OCI blob descriptor size exceeded its response bound"
 )
+_RESOURCE_LIMIT_TEMPLATE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI resource limit violation: {violation}"
+)
 _STORED_RECORDS_MESSAGE = (
     "stored envelope records are inconsistent"  # pragma: no mutate - diagnostic
 )
@@ -318,7 +321,7 @@ class _ExpectedLayer:
     path: str
     media_type: str
     digest: Sha256Digest
-    size: int | None
+    size: int
     exact_bytes: bytes | None = None
 
 
@@ -338,12 +341,15 @@ class OrasAdapter:
 
     runner: OrasRunner
     repository: str
+    limits: OciResourceLimits = DEFAULT_OCI_RESOURCE_LIMITS
 
     def __post_init__(self) -> None:
         _validate_repository(self.repository)
+        if not isinstance(self.limits, OciResourceLimits):
+            raise TypeError("limits must use the OCI resource policy contract")
 
     def plan_push(self, bundle: EnvelopeBundle) -> OrasInvocation:
-        return _plan_push(_validate_bundle(bundle), self.repository)
+        return _plan_push(_validate_bundle(bundle), self.repository, self.limits)
 
     async def inspect(self, reference: OciReference, attempt_id: str) -> StoredEnvelope | None:
         validate_attempt_id(attempt_id)
@@ -354,6 +360,7 @@ class OrasAdapter:
     async def persist(self, bundle: EnvelopeBundle, attempt_id: str) -> StoredEnvelope:
         validate_attempt_id(attempt_id)
         validated = _validate_bundle(bundle)
+        _require_expected_resource_limits(validated, self.limits, InvalidIdentity)
         reference = _content_reference(bundle, self.repository)
         existing = await self._observe_tag(reference, attempt_id)
         if existing is not None:
@@ -383,9 +390,9 @@ class OrasAdapter:
         return _stored_required(reference, observed)
 
     async def _push(self, bundle: _ValidatedBundle, attempt_id: str) -> _Observation:
-        result = await self.runner.run(_plan_push(bundle, self.repository), attempt_id)
+        result = await self.runner.run(_plan_push(bundle, self.repository, self.limits), attempt_id)
         content = _successful_exported_file(result)
-        return _parse_manifest(content)
+        return _parse_manifest(content, self.limits)
 
     async def _recover_timeout(
         self,
@@ -405,7 +412,7 @@ class OrasAdapter:
         content = _manifest_stdout_or_none(result)
         if content is None:
             return None
-        observation = _parse_manifest(content)
+        observation = _parse_manifest(content, self.limits)
         _require_declared_manifest(reference, observation.digest)
         return await self._observe_digest(observation, reference.repository, attempt_id)
 
@@ -417,7 +424,7 @@ class OrasAdapter:
         content = _successful_stdout(result, MAX_MANIFEST_BYTES)
         if content != expected.content:
             raise diagnostic_error(MalformedProviderResponse, _MANIFEST_DIGEST_MESSAGE)
-        return _parse_manifest(content)
+        return _parse_manifest(content, self.limits)
 
     async def _require_bundle(
         self,
@@ -444,7 +451,7 @@ class OrasAdapter:
             _require_blob(content, layer, conflict_type)
 
     async def _fetch_blob(self, descriptor: _Descriptor, repository: str, attempt_id: str) -> bytes:
-        _require_bounded_blob_size(descriptor.size)
+        _require_bounded_blob_size(descriptor.size, self.limits)
         reference = f"{repository}@{descriptor.digest}"
         result = await self.runner.run(_blob_fetch(reference), attempt_id)
         content = _successful_stdout(result, descriptor.size)
@@ -463,9 +470,12 @@ class OrasAdapter:
         return _restore_bundle(observation.manifest, contents)
 
 
-def _plan_push(bundle: _ValidatedBundle, repository: str) -> OrasInvocation:
+def _plan_push(
+    bundle: _ValidatedBundle, repository: str, limits: OciResourceLimits
+) -> OrasInvocation:
     layers = _expected_layers(bundle)
     _validate_expected_layers(layers)
+    _require_resource_limits(tuple(item.size for item in layers), limits, InvalidIdentity)
     argv = _push_argv(repository, bundle.bundle, layers)
     return OrasInvocation(argv, _input_bytes(bundle))
 
@@ -714,7 +724,7 @@ def _artifact_layer(artifact: Artifact) -> _ExpectedLayer:
 
 
 def _sbom_layer(sbom: Sbom) -> _ExpectedLayer:
-    return _ExpectedLayer(sbom.path.value, sbom.media_type, sbom.sha256, None)
+    return _ExpectedLayer(sbom.path.value, sbom.media_type, sbom.sha256, sbom.size)
 
 
 def _manifest_fetch(reference: str) -> OrasInvocation:
@@ -785,13 +795,17 @@ def _raise_result_error(result: OrasResult) -> NoReturn:
     raise diagnostic_error(ProviderUnavailable, _UNAVAILABLE_MESSAGE)
 
 
-def _parse_manifest(content: bytes) -> _Observation:
+def _parse_manifest(content: bytes, limits: OciResourceLimits) -> _Observation:
     bounded = _bounded_stdout(content, MAX_MANIFEST_BYTES)
     try:
         manifest = _Manifest.model_validate(parse_bounded_json(bounded, MAX_MANIFEST_BYTES))
     except (ValidationError, ValueError) as error:
         raise diagnostic_error(MalformedProviderResponse, _MALFORMED_MANIFEST_MESSAGE) from error
     _validate_manifest_layers(manifest)
+    descriptors = (manifest.config, *manifest.layers)
+    _require_resource_limits(
+        tuple(item.size for item in descriptors), limits, MalformedProviderResponse
+    )
     return _Observation(bounded, Sha256Digest.from_bytes(bounded), manifest)
 
 
@@ -873,7 +887,7 @@ def _require_descriptor(
 ) -> None:
     identity = (descriptor.title, descriptor.media_type, descriptor.digest)
     wanted = (_expected_title(expected), expected.media_type, expected.digest.value)
-    if identity != wanted or (expected.size is not None and descriptor.size != expected.size):
+    if identity != wanted or descriptor.size != expected.size:
         raise diagnostic_error(conflict_type, _DESCRIPTOR_CONFLICT_MESSAGE)
 
 
@@ -901,7 +915,7 @@ def _require_blob_digest(
 def _require_blob_size(
     content: bytes, expected: _ExpectedLayer, conflict_type: type[OrasAdapterError]
 ) -> None:
-    if expected.size is not None and len(content) != expected.size:
+    if len(content) != expected.size:
         raise diagnostic_error(conflict_type, _BLOB_SIZE_CONFLICT_MESSAGE)
 
 
@@ -921,9 +935,27 @@ def _require_descriptor_bytes(
             raise diagnostic_error(MalformedProviderResponse, _BLOB_DIGEST_MESSAGE)
 
 
-def _require_bounded_blob_size(size: int) -> None:
-    if size > MAX_BLOB_BYTES:
+def _require_bounded_blob_size(size: int, limits: OciResourceLimits) -> None:
+    if size > limits.max_file_bytes:
         raise diagnostic_error(MalformedProviderResponse, _BLOB_BOUND_MESSAGE)
+
+
+def _require_expected_resource_limits(
+    bundle: _ValidatedBundle,
+    limits: OciResourceLimits,
+    error_type: type[Exception],
+) -> None:
+    sizes = tuple(item.size for item in _expected_layers(bundle))
+    _require_resource_limits(sizes, limits, error_type)
+
+
+def _require_resource_limits(
+    sizes: tuple[int, ...], limits: OciResourceLimits, error_type: type[Exception]
+) -> None:
+    violation = limits.evaluate(sizes).violation
+    if violation is not None:
+        message = _RESOURCE_LIMIT_TEMPLATE.format(violation=violation.value)
+        raise diagnostic_error(error_type, message)
 
 
 def _stored(reference: OciReference, observation: _Observation | None) -> StoredEnvelope | None:
@@ -1131,6 +1163,7 @@ def _sbom(document: SbomDocument) -> Sbom:
         ArtifactPath(document.artifact_path),
         ArtifactPath(document.path),
         document.media_type,
+        document.size,
         Sha256Digest(document.sha256),
     )
 

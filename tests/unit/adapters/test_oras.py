@@ -17,6 +17,7 @@ from portfolio_delivery.adapters.oras import (
     ProviderTimeout,
     ProviderUnavailable,
 )
+from portfolio_delivery.contracts.oci import DEFAULT_OCI_RESOURCE_LIMITS
 from portfolio_delivery.domain.artifacts import (
     Artifact,
     Evidence,
@@ -25,6 +26,7 @@ from portfolio_delivery.domain.artifacts import (
     Sbom,
     ToolchainIdentity,
 )
+from portfolio_delivery.domain.errors import InvalidIdentity
 from portfolio_delivery.domain.identity import (
     ArtifactPath,
     ProjectId,
@@ -71,6 +73,7 @@ MAX_MANIFEST_BYTES: Final[int] = 1_048_576
 MAX_PROCESS_OUTPUT_BYTES: Final[int] = 65_536
 EXPECTED_INITIAL_OBSERVATIONS: Final[int] = 8
 OVERSIZED_BLOB: Final[int] = 1_073_741_825
+MIB: Final[int] = 1_048_576
 SECOND_ARTIFACT_BYTES: Final[bytes] = b"second-wheel"
 SECOND_SBOM_BYTES: Final[bytes] = b'{"bomFormat":"CycloneDX","serialNumber":"two"}\n'
 SIGNATURE_BYTES: Final[bytes] = b"detached-signature"
@@ -174,11 +177,26 @@ def make_artifact() -> Artifact:
     )
 
 
+def make_sized_bundle(sizes: tuple[int, ...]) -> EnvelopeBundle:
+    base = make_artifact()
+    artifacts = tuple(
+        replace(
+            base,
+            name=f"package-{index}",
+            path=ArtifactPath(f"artifacts/package-{index}.whl"),
+            size=size,
+        )
+        for index, size in enumerate(sizes)
+    )
+    return make_bundle_from(artifacts, ())
+
+
 def make_sbom(artifact: Artifact) -> Sbom:
     return Sbom(
         artifact.path,
         ArtifactPath("sbom/package.cdx.json"),
         "application/vnd.cyclonedx+json",
+        len(SBOM_BYTES),
         make_digest(SBOM_BYTES),
     )
 
@@ -200,6 +218,7 @@ def make_two_artifact_bundle() -> EnvelopeBundle:
         second.path,
         ArtifactPath("sbom/second.cdx.json"),
         "application/vnd.cyclonedx+json",
+        len(SECOND_SBOM_BYTES),
         make_digest(SECOND_SBOM_BYTES),
     )
     return make_bundle_from((second, first), (second_sbom, make_sbom(first)))
@@ -645,16 +664,74 @@ async def test_should_reject_exported_file_on_blob_fetch(exported: bytes) -> Non
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("size", (len(SBOM_BYTES) + 1, OVERSIZED_BLOB))
-async def test_should_reject_invalid_or_unbounded_blob_descriptor_size(size: int) -> None:
+@pytest.mark.parametrize(
+    ("size", "error_type", "message"),
+    (
+        (len(SBOM_BYTES) + 1, ArtifactConflict, "descriptor"),
+        (OVERSIZED_BLOB, MalformedProviderResponse, "resource"),
+    ),
+)
+async def test_should_reject_invalid_or_unbounded_blob_descriptor_size(
+    size: int, error_type: type[Exception], message: str
+) -> None:
     scenario = make_scenario()
     await scenario.adapter.persist(scenario.bundle, "attempt-seed")
     reference = f"{REPOSITORY}:{content_reference(scenario.bundle).tag}"
     mutated = mutate_sbom_size(scenario.runner.manifests[reference], size)
     scenario.runner.put_manifest(reference, mutated)
 
-    with pytest.raises(MalformedProviderResponse, match="size"):
+    with pytest.raises(error_type, match=message):
         await scenario.adapter.persist(scenario.bundle, "attempt-size")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sizes", "violation"),
+    (
+        ((1,) * 254, "descriptor-count"),
+        ((64 * MIB + 1,), "file-size"),
+        ((64 * MIB,) * 8 + (1,), "aggregate-size"),
+    ),
+)
+async def test_should_reject_resource_overflow_before_persist_provider(
+    sizes: tuple[int, ...], violation: str
+) -> None:
+    # Given
+    runner = FakeOrasRunner()
+    adapter = OrasAdapter(runner, REPOSITORY)
+
+    # When / Then
+    with pytest.raises(ValueError, match=f"resource limit violation: {violation}"):
+        await adapter.persist(make_sized_bundle(sizes), "attempt-resource-overflow")
+    assert runner.invocations == []
+
+
+def test_should_reject_resource_overflow_when_push_is_planned_directly() -> None:
+    # Given
+    adapter = OrasAdapter(FakeOrasRunner(), REPOSITORY)
+
+    # When / Then
+    with pytest.raises(InvalidIdentity, match="descriptor-count"):
+        adapter.plan_push(make_sized_bundle((1,) * 254))
+
+
+@pytest.mark.asyncio
+async def test_should_reject_restore_overflow_before_any_blob_fetch() -> None:
+    # Given
+    scenario = make_scenario()
+    await scenario.adapter.persist(scenario.bundle, "attempt-seed")
+    reference = content_reference(scenario.bundle)
+    manifest = scenario.runner.manifests[f"{REPOSITORY}:{reference.tag}"]
+    hostile = mutate_sbom_size(manifest, 64 * MIB + 1)
+    scenario.runner.put_manifest(f"{REPOSITORY}:{reference.tag}", hostile)
+    poisoned = OciReference(REPOSITORY, reference.tag, Sha256Digest.from_bytes(hostile))
+    scenario.runner.invocations.clear()
+
+    # When / Then
+    with pytest.raises(MalformedProviderResponse, match="resource"):
+        await scenario.adapter.restore(poisoned, "attempt-restore-overflow")
+    commands = tuple(item.argv[1:3] for item, _attempt in scenario.runner.invocations)
+    assert ("blob", "fetch") not in commands
 
 
 @pytest.mark.parametrize("repository", ("https://ghcr.io/repo", "UPPER/repo", "x" * 256))
@@ -904,7 +981,15 @@ def test_should_reject_descriptor_size_or_digest_difference(content: bytes) -> N
 
 
 def test_should_accept_exact_maximum_blob_descriptor_size() -> None:
-    oras_contracts._require_bounded_blob_size(1_073_741_824)
+    limit = DEFAULT_OCI_RESOURCE_LIMITS
+    oras_contracts._require_bounded_blob_size(limit.max_file_bytes, limit)
+
+
+def test_should_reject_blob_descriptor_above_shared_file_limit() -> None:
+    limit = DEFAULT_OCI_RESOURCE_LIMITS
+
+    with pytest.raises(MalformedProviderResponse, match="descriptor size exceeded"):
+        oras_contracts._require_bounded_blob_size(limit.max_file_bytes + 1, limit)
 
 
 def test_should_preserve_reference_when_observation_is_stored() -> None:

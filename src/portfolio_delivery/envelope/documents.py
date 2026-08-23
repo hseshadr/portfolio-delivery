@@ -117,6 +117,7 @@ class SbomDocument(BoundaryDocument):  # type: ignore[explicit-any]
     artifact_path: str = Field(alias="artifactPath")
     path: str
     media_type: str = Field(alias="mediaType")
+    size: int = Field(ge=0, strict=True)
     sha256: str
 
     @field_validator("artifact_path", "path")

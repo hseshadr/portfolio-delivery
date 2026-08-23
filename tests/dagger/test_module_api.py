@@ -257,11 +257,12 @@ def _artifact_declaration(path: Path) -> dict[str, str | int]:
     }
 
 
-def _sbom_declaration(path: Path) -> dict[str, str]:
+def _sbom_declaration(path: Path) -> dict[str, str | int]:
     return {
         "artifactPath": "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl",
         "path": "sbom/package.cdx.json",
         "mediaType": "application/vnd.cyclonedx+json",
+        "size": path.stat().st_size,
         "sha256": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
     }
 

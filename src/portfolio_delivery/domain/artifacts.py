@@ -88,11 +88,13 @@ class Sbom:
     artifact_path: ArtifactPath
     path: ArtifactPath
     media_type: str
+    size: int
     sha256: Sha256Digest
 
     def __post_init__(self) -> None:
         _validate_sbom_identities(self.artifact_path, self.path, self.sha256)
         _require_value(self.media_type)
+        _validate_size(self.size)
 
 
 @dataclass(frozen=True, slots=True)

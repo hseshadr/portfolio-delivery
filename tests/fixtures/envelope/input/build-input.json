@@ -33,8 +33,8 @@
       "name": "package",
       "path": "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl",
       "mediaType": "application/vnd.python.wheel",
-      "size": 30894,
-      "sha256": "sha256:791b7e80515490349592762d739f03fdff329336f63324b3eeb4261bc315bdcd"
+      "size": 37299,
+      "sha256": "sha256:5ef7f0b05629c2c61bd84ff5ef30149092bddaa0bca35a5f41fffc222459db43"
     },
     {
       "name": "alpha",
@@ -49,7 +49,8 @@
       "artifactPath": "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl",
       "path": "sbom/package.cdx.json",
       "mediaType": "application/vnd.cyclonedx+json",
-      "sha256": "sha256:6cd751513f5eae9aade59a0f042a886a6b71174b04f0d1c969be808c42e35af3"
+      "size": 598,
+      "sha256": "sha256:3f634fa2ad01ec204f8defe3995e4ace84c7aeff03675154e4f0d956359111d7"
     }
   ],
   "prequalificationEvidence": [

@@ -56,6 +56,22 @@ def test_should_reject_boolean_epoch_when_document_is_parsed() -> None:
         BuildEnvelopeDocument.model_validate(payload)
 
 
+@pytest.mark.parametrize("size", (None, -1, True))
+def test_should_require_non_negative_sbom_size_when_document_is_parsed(
+    size: int | bool | None,
+) -> None:
+    # Given
+    payload = json.loads(fixture_bytes("input/build-input.json"))
+    if size is None:
+        del payload["sboms"][0]["size"]
+    else:
+        payload["sboms"][0]["size"] = size
+
+    # When / Then
+    with pytest.raises(ValidationError):
+        BuildEnvelopeDocument.model_validate(payload)
+
+
 def test_should_reject_content_larger_than_global_limit_when_caller_limit_is_larger() -> None:
     # Given
     content = b'{"value":"' + (b"x" * 1_048_576) + b'"}'
@@ -269,6 +285,7 @@ def _alpha_sbom() -> dict[str, object]:
         "artifactPath": "artifacts/alpha.txt",
         "path": "sbom/alpha.cdx.json",
         "mediaType": "application/vnd.cyclonedx+json",
+        "size": 1,
         "sha256": _digest("e"),
     }
 

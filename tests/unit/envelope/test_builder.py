@@ -143,6 +143,7 @@ def test_should_serialize_signed_build_components_when_envelope_is_assembled() -
         artifact.path,
         ArtifactPath("sbom/catalog.cdx.json"),
         "application/vnd.cyclonedx+json",
+        42,
         make_digest("1"),
     )
     lock = LockIdentity(ArtifactPath("uv.lock"), make_digest("2"))

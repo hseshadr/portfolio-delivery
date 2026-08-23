@@ -698,8 +698,8 @@ def _validate_artifact_records(
 def _validate_sbom_records(
     declared: tuple[SbomDocument, ...], actual: tuple[FileRecord, ...]
 ) -> None:
-    expected = {item.path: item.sha256 for item in declared}
-    observed = {item.path: item.sha256 for item in actual}
+    expected = {item.path: (item.size, item.sha256) for item in declared}
+    observed = {item.path: (item.size, item.sha256) for item in actual}
     if expected != observed:
         raise InvalidIdentity("SBOM bytes must exactly match envelope declarations")
 
@@ -801,6 +801,7 @@ def _sbom(document: SbomDocument) -> Sbom:
         ArtifactPath(document.artifact_path),
         ArtifactPath(document.path),
         document.media_type,
+        document.size,
         Sha256Digest(document.sha256),
     )
 

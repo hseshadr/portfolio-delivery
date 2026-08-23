@@ -25,13 +25,13 @@ from dagger import (
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from portfolio_delivery.adapters.oras import (
-    MAX_BLOB_BYTES,
     MAX_MANIFEST_BYTES,
     MAX_PROCESS_STDOUT_BYTES,
     MAX_STDERR_BYTES,
     MalformedProviderResponse,
     OrasAdapter,
 )
+from portfolio_delivery.contracts.oci import DEFAULT_OCI_RESOURCE_LIMITS
 from portfolio_delivery.contracts.storage import OrasRunner
 from portfolio_delivery.domain.artifacts import (
     Artifact,
@@ -105,15 +105,12 @@ CORE_INPUT_PATHS: Final = (
 )
 TIMEOUT_EXIT_CODE: Final = 124
 DEFAULT_EXECUTION_DEADLINE_SECONDS: Final = 120
-MAX_RESTORE_DESCRIPTORS: Final = 256
-MAX_RESTORE_FILE_BYTES: Final = 67_108_864
-MAX_RESTORE_TOTAL_BYTES: Final = 536_870_912
 OUTPUT_CHUNK_BYTES: Final = 1_048_576
 ORAS_PUSH_PREFIX_ARGUMENTS: Final = 12
 REGISTRY_CONFIG_OPTION_ARGUMENTS: Final = 2
 REGISTRY_SERVICE_OPTION_ARGUMENTS: Final = 1
 DEADLINE_WRAPPER_ARGUMENTS: Final = 5
-MAX_OBSERVATION_ARGUMENTS: Final = MAX_RESTORE_DESCRIPTORS + (
+MAX_OBSERVATION_ARGUMENTS: Final = DEFAULT_OCI_RESOURCE_LIMITS.max_descriptors + (
     ORAS_PUSH_PREFIX_ARGUMENTS
     + REGISTRY_CONFIG_OPTION_ARGUMENTS
     + REGISTRY_SERVICE_OPTION_ARGUMENTS
@@ -519,7 +516,7 @@ def _stdout_limit(invocation: OrasInvocation) -> int:
     if command == ("manifest", "fetch"):
         return MAX_MANIFEST_BYTES
     if command == ("blob", "fetch"):
-        return min(MAX_BLOB_BYTES, MAX_RESTORE_FILE_BYTES)
+        return DEFAULT_OCI_RESOURCE_LIMITS.max_file_bytes
     return MAX_PROCESS_STDOUT_BYTES
 
 
@@ -633,19 +630,9 @@ def _validate_restore_manifest(content: bytes) -> None:
 
 def _require_restore_descriptor_bounds(descriptors: tuple[_RestoreDescriptor, ...]) -> None:
     sizes = tuple(item.size for item in descriptors)
-    message = _layer_bound_error(sizes)
-    if message is not None:
-        raise MalformedProviderResponse(message)
-
-
-def _layer_bound_error(sizes: tuple[int, ...]) -> str | None:
-    if len(sizes) > MAX_RESTORE_DESCRIPTORS:
-        return "OCI layer set exceeds its descriptor count bound"
-    if any(size > MAX_RESTORE_FILE_BYTES for size in sizes):
-        return "OCI layer exceeds its per-file byte bound"
-    if sum(sizes) > MAX_RESTORE_TOTAL_BYTES:
-        return "OCI layer set exceeds its aggregate byte bound"
-    return None
+    violation = DEFAULT_OCI_RESOURCE_LIMITS.evaluate(sizes).violation
+    if violation is not None:
+        raise MalformedProviderResponse(f"OCI resource limit violation: {violation.value}")
 
 
 async def qualified_bundle(
@@ -847,6 +834,7 @@ def _sboms(document: BuildEnvelopeDocument) -> tuple[Sbom, ...]:
             ArtifactPath(item.artifact_path),
             ArtifactPath(item.path),
             item.media_type,
+            item.size,
             Sha256Digest(item.sha256),
         )
         for item in document.sboms
@@ -880,21 +868,8 @@ async def persist_qualified_bundle(
     validated = await _qualified_bundle_outputs(bundle, scanner)
     runner = runner_factory(validated.bundle)
     adapter = OrasAdapter(runner, repository)
-    _require_persist_layer_bounds(validated, adapter)
     stored = await adapter.persist(validated.bundle, attempt_id)
     return stored_dto(stored, cast(DaggerOrasRunner, runner))
-
-
-def _require_persist_layer_bounds(validated: ValidatedBundleOutputs, adapter: OrasAdapter) -> None:
-    invocation = adapter.plan_push(validated.bundle)
-    output_records = (*validated.artifacts.files, *validated.sboms.files)
-    sizes = (
-        *tuple(len(item) for item in invocation.input_bytes),
-        *(item.size for item in output_records),
-    )
-    message = _layer_bound_error(sizes)
-    if message is not None:
-        raise InvalidIdentity(message)
 
 
 def stored_dto(stored: CoreStoredEnvelope, runner: DaggerOrasRunner) -> StoredEnvelope:

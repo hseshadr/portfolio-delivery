@@ -56,7 +56,6 @@ from tests.dagger.test_module_api import (
     pipeline_files,
 )
 from tests.unit.adapters.test_oras import (
-    SBOM_BYTES,
     make_bundle,
     make_bundle_from,
     make_sbom,
@@ -408,7 +407,7 @@ async def test_should_reject_persist_when_restore_would_reject(sizes: tuple[int,
     runner = RecordingRunner()
 
     # When / Then
-    with pytest.raises(InvalidIdentity, match="layer"):
+    with pytest.raises(InvalidIdentity, match="resource"):
         await oras_runtime.persist_qualified_bundle(
             dto, scanner, lambda _: runner, "registry.example/repo", "attempt-budget"
         )
@@ -436,7 +435,7 @@ async def test_should_reject_descriptor_overflow_before_persist_provider() -> No
     runner = ObservationBoundaryRunner()
 
     # When / Then
-    with pytest.raises(InvalidIdentity, match="descriptor count"):
+    with pytest.raises(InvalidIdentity, match="descriptor-count"):
         await oras_runtime.persist_qualified_bundle(
             dto, scanner, lambda _: runner, "registry.example/repo", "attempt-overflow"
         )
@@ -639,7 +638,7 @@ def _artifact_manifest(bundle: EnvelopeBundle) -> FileManifest:
 
 def _sbom_manifest(bundle: EnvelopeBundle) -> FileManifest:
     records = tuple(
-        FileRecord(path=item.path.value, size=len(SBOM_BYTES), sha256=item.sha256.value)
+        FileRecord(path=item.path.value, size=item.size, sha256=item.sha256.value)
         for item in bundle.sboms
     )
     return FileManifest(files=records)

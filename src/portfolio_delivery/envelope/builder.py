@@ -218,6 +218,7 @@ def _sbom_document(sbom: Sbom) -> SbomDocument:
         artifactPath=sbom.artifact_path.value,
         path=sbom.path.value,
         mediaType=sbom.media_type,
+        size=sbom.size,
         sha256=sbom.sha256.value,
     )
 
