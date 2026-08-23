@@ -43,6 +43,7 @@ class PipelineFiles:
     source: Path
     inventory: Path
     build_input: Path
+    evidence: Path
     artifacts: Path
     sboms: Path
     output: Path
@@ -151,8 +152,15 @@ def pipeline_files(tmp_path: Path) -> PipelineFiles:
     _write_pipeline_bytes(source, artifacts, sboms)
     inventory, digest = _pipeline_inventory(source, tmp_path)
     build_input = _pipeline_document(tmp_path, digest, artifacts, sboms)
+    evidence = _pipeline_evidence(tmp_path, digest)
     return PipelineFiles(
-        source, inventory, build_input, artifacts, sboms, tmp_path / "publish-inputs.tar"
+        source,
+        inventory,
+        build_input,
+        evidence,
+        artifacts,
+        sboms,
+        tmp_path / "publish-inputs.tar",
     )
 
 
@@ -183,6 +191,18 @@ def _pipeline_document(tmp_path: Path, digest: str, artifacts: Path, sboms: Path
     build_input = tmp_path / "build-input.json"
     build_input.write_text(json.dumps(document), encoding="utf-8")
     return build_input
+
+
+def _pipeline_evidence(tmp_path: Path, digest: str) -> Path:
+    document = {
+        "evidence": [{"kind": "test", "name": "unit", "status": "passed", "subject": digest}],
+        "schemaVersion": "v1",
+    }
+    evidence = tmp_path / "prequalification-evidence.v1.json"
+    evidence.write_text(
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+    return evidence
 
 
 def _artifact_declaration(path: Path) -> dict[str, str | int]:
@@ -241,6 +261,7 @@ def _pipeline_references(files: PipelineFiles) -> tuple[str, ...]:
         f"src=$(host | directory --path={files.source})",
         f"inv=$(host | file --path={files.inventory})",
         f"input=$(host | file --path={files.build_input})",
+        f"evidence=$(host | file --path={files.evidence})",
         f"arts=$(host | directory --path={files.artifacts})",
         f"sboms=$(host | directory --path={files.sboms})",
     )
@@ -248,7 +269,10 @@ def _pipeline_references(files: PipelineFiles) -> tuple[str, ...]:
 
 def _plan_shell(symlink_target: str | None) -> str:
     target = "" if symlink_target is None else f" --symlink-target={shlex.quote(symlink_target)}"
-    return 'plan=$(plan --build-input="$input" --artifacts="$arts" --sboms="$sboms"' + target + ")"
+    return (
+        'plan=$(plan --build-input="$input" --artifacts="$arts" --sboms="$sboms" '
+        '--prequalification-evidence="$evidence"' + target + ")"
+    )
 
 
 def archive_bytes(archive: tarfile.TarFile, name: str) -> bytes:
@@ -292,6 +316,10 @@ def bounded_entry(path: str, size: int = 0) -> dict[str, str | int]:
         "sha256": "sha256:" + "0" * 64,
         "size": size,
     }
+
+
+def actual_entry(files: PipelineFiles) -> dict[str, str | int]:
+    return inventory_entry(files.source / "src/app.py", files.source)
 
 
 def test_should_expose_phase_one_functions_when_module_is_introspected() -> None:
@@ -373,17 +401,19 @@ def _assert_archive(archive: tarfile.TarFile, files: PipelineFiles) -> None:
     assert set(archive.getnames()) == expected
     assert archive_bytes(archive, "artifacts/package.whl") == b"wheel"
     assert archive_bytes(archive, "sbom/package.cdx.json") == b'{"bomFormat":"CycloneDX"}\n'
-    _assert_records(archive)
+    _assert_records(archive, files)
     _assert_checksums(archive, expected - {"checksums.sha256"})
 
 
-def _assert_records(archive: tarfile.TarFile) -> None:
+def _assert_records(archive: tarfile.TarFile, files: PipelineFiles) -> None:
     envelope_bytes = archive_bytes(archive, "records/build-envelope.v1.json")
     qualification_bytes = archive_bytes(archive, "records/qualification-record.v1.json")
     envelope = json.loads(envelope_bytes)
     qualification = json.loads(qualification_bytes)
     digest = "sha256:" + hashlib.sha256(envelope_bytes).hexdigest()
     assert envelope["artifacts"][0]["sha256"] == "sha256:" + hashlib.sha256(b"wheel").hexdigest()
+    expected_evidence = json.loads(files.evidence.read_bytes())["evidence"]
+    assert envelope["prequalificationEvidence"] == expected_evidence
     assert qualification["subject"] == digest
     assert qualification["qualificationEvidence"][0]["subject"] == digest
 
@@ -461,6 +491,119 @@ def test_should_reject_oversized_json_before_reading_contents(tmp_path: Path) ->
     assert "configured JSON byte limit" in result.stderr
 
 
+@pytest.mark.parametrize(
+    ("kind", "mode", "message"),
+    [
+        ("regular", "120000", "canonical Git kind and mode"),
+        ("regular", "100600", "canonical Git kind and mode"),
+        ("symlink", "100644", "canonical Git kind and mode"),
+        ("submodule", "100644", "canonical Git kind and mode"),
+        ("submodule", "160000", "selected source inventory entries must be regular"),
+        ("device", "100644", "canonical Git kind and mode"),
+    ],
+)
+def test_should_reject_noncanonical_git_kind_mode_combinations(
+    tmp_path: Path, kind: str, mode: str, message: str
+) -> None:
+    # Given
+    files = pipeline_files(tmp_path)
+    entry = actual_entry(files)
+    entry.update({"kind": kind, "mode": mode})
+    rewrite_inventory(files, [entry])
+
+    # When
+    result = run_version(files)
+
+    # Then
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+def test_should_accept_executable_regular_git_mode(tmp_path: Path) -> None:
+    # Given
+    files = pipeline_files(tmp_path)
+    entry = actual_entry(files)
+    entry["mode"] = "100755"
+    rewrite_inventory(files, [entry])
+
+    # When
+    result = run_version(files)
+
+    # Then
+    assert result.returncode == 0, result.stderr
+
+
+def test_should_reject_noncanonical_inventory_order(tmp_path: Path) -> None:
+    # Given
+    files = pipeline_files(tmp_path)
+    second = files.source / "src/second.py"
+    second.write_bytes(b"second")
+    entries = [inventory_entry(second, files.source), actual_entry(files)]
+    rewrite_inventory(files, entries)
+
+    # When
+    result = run_version(files)
+
+    # Then
+    assert result.returncode != 0
+    assert "canonical path order" in result.stderr
+
+
+def test_should_reject_duplicate_inventory_path(tmp_path: Path) -> None:
+    # Given
+    files = pipeline_files(tmp_path)
+    entry = actual_entry(files)
+    rewrite_inventory(files, [entry, entry])
+
+    # When
+    result = run_version(files)
+
+    # Then
+    assert result.returncode != 0
+    assert "unique" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "mutation", ["empty", "malformed", "subject", "status", "name", "extra", "missing"]
+)
+def test_should_reject_detached_prequalification_evidence_mismatch(
+    tmp_path: Path, live_fixture: Path, mutation: str
+) -> None:
+    # Given
+    files = pipeline_files(tmp_path)
+    _mutate_evidence(files, mutation)
+
+    # When
+    result = run_pipeline(files, live_fixture)
+
+    # Then
+    assert result.returncode != 0
+    assert "evidence" in result.stderr.lower()
+
+
+def _mutate_evidence(files: PipelineFiles, mutation: str) -> None:
+    if mutation == "malformed":
+        files.evidence.write_text("{", encoding="utf-8")
+        return
+    document = json.loads(files.evidence.read_text(encoding="utf-8"))
+    records = document["evidence"]
+    if mutation == "empty":
+        document = {}
+    elif mutation == "subject":
+        records[0]["subject"] = "sha256:" + "0" * 64
+    elif mutation == "status":
+        records[0]["status"] = "failed"
+    elif mutation == "name":
+        records[0]["name"] = "different"
+    elif mutation == "extra":
+        records.append({**records[0], "name": "extra"})
+    else:
+        document["evidence"] = []
+    files.evidence.write_text(
+        json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"
+    )
+
+
 @pytest.mark.parametrize("bound", ["count", "path", "file", "total"])
 def test_should_reject_hostile_source_inventory_bounds(tmp_path: Path, bound: str) -> None:
     # Given
@@ -477,7 +620,8 @@ def test_should_reject_hostile_source_inventory_bounds(tmp_path: Path, bound: st
 
 def _hostile_entries(bound: str) -> list[dict[str, str | int]]:
     if bound == "count":
-        return [bounded_entry(f"src/{index}") for index in range(4_097)]
+        paths = sorted(f"src/{index}" for index in range(4_097))
+        return [bounded_entry(path) for path in paths]
     if bound == "path":
         return [bounded_entry("src/" + "x" * 1_024)]
     if bound == "file":

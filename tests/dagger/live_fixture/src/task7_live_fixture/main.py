@@ -97,13 +97,14 @@ class Task7LiveFixture:
         build_input: dagger.File,
         artifacts: dagger.Directory,
         sboms: dagger.Directory,
+        prequalification_evidence: dagger.File,
         symlink_target: str | None = None,
     ) -> FixturePlan:
         return FixturePlan(
             input_file=build_input,
             artifact_directory=_artifact_directory(artifacts, symlink_target),
             sbom_directory=sboms,
-            check_file=dag.file("prequalification.json", "{}"),
+            check_file=prequalification_evidence,
         )
 
 

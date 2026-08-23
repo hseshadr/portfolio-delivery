@@ -74,6 +74,7 @@ from portfolio_delivery_dagger.interfaces import (
 from portfolio_delivery_dagger.inventory import (
     FileManifest,
     FileRecord,
+    PrequalificationEvidenceDocument,
     SourceInventoryDocument,
     SourceInventoryEntry,
 )
@@ -226,8 +227,8 @@ class PortfolioDelivery:
             build.build_input, build.artifacts, build.sboms, build.input_snapshot_sha256
         )
         evidence = await _check_dto(checked)
-        await _validate_prequalification(build, evidence)
-        return _prequalified_dto(build)
+        evidence_sha256 = await _validate_prequalification(build, evidence)
+        return _prequalified_dto(build, evidence.evidence, evidence_sha256)
 
     @function
     async def sign(self, build: PrequalifiedBuild, plan: SigningPlan) -> SignedBuild:
@@ -484,20 +485,41 @@ async def _unsigned_dto(source: SnapshottedSource, output: BuildOutput) -> Unsig
     )
 
 
-async def _validate_prequalification(build: UnsignedBuild, evidence: CheckEvidence) -> None:
-    content = await _bounded_bytes(evidence.evidence, MAX_JSON_BYTES)
-    parse_bounded_json(content, MAX_JSON_BYTES)
+async def _validate_prequalification(build: UnsignedBuild, evidence: CheckEvidence) -> str:
+    document, digest = await _prequalification_document(evidence.evidence)
+    checks = tuple(_evidence(item) for item in document.evidence)
+    _validate_check_summary(evidence.passed, checks)
+    _validate_evidence_subjects(document.evidence, build.source_tree_sha256)
     if not evidence.passed:
         raise InvalidIdentity("prequalification must pass before signing")
+    return digest
 
 
-def _prequalified_dto(build: UnsignedBuild) -> PrequalifiedBuild:
+async def _prequalification_document(
+    evidence: File,
+) -> tuple[PrequalificationEvidenceDocument, str]:
+    try:
+        content = await _bounded_bytes(evidence, MAX_JSON_BYTES)
+        payload = parse_bounded_json(content, MAX_JSON_BYTES)
+        document = PrequalificationEvidenceDocument.model_validate(payload)
+    except ValueError as error:
+        message = "prequalification evidence must be bounded canonical evidence"
+        raise InvalidIdentity(message) from error
+    _require(
+        content == canonical_json_bytes(document), "prequalification evidence must be canonical"
+    )
+    return document, Sha256Digest.from_bytes(content).value
+
+
+def _prequalified_dto(build: UnsignedBuild, evidence: File, digest: str) -> PrequalifiedBuild:
     return PrequalifiedBuild(
         source=build.source,
         build_input=build.build_input,
         input_snapshot_sha256=build.input_snapshot_sha256,
         artifacts=build.artifacts,
         sboms=build.sboms,
+        prequalification_evidence=evidence,
+        prequalification_evidence_sha256=digest,
         project=build.project,
         version=build.version,
         repository=build.repository,
@@ -515,6 +537,8 @@ async def _signed_dto(build: PrequalifiedBuild, signed: SigningOutput) -> Signed
         input_snapshot_sha256=build.input_snapshot_sha256,
         artifacts=signed.artifacts(),
         sboms=signed.sboms(),
+        prequalification_evidence=build.prequalification_evidence,
+        prequalification_evidence_sha256=build.prequalification_evidence_sha256,
         signature_path=signature_path,
         project=build.project,
         version=build.version,
@@ -553,6 +577,21 @@ async def _validate_build_bytes(document: BuildEnvelopeDocument, build: SignedBu
     _validate_sbom_records(document.sboms, sboms.files)
     _validate_publish_paths(artifacts.files, sboms.files)
     _validate_evidence_subjects(document.prequalification_evidence, build.source_tree_sha256)
+    await _validate_retained_evidence(document.prequalification_evidence, build)
+
+
+async def _validate_retained_evidence(
+    declared: tuple[EvidenceDocument, ...], build: SignedBuild
+) -> None:
+    document, digest = await _prequalification_document(build.prequalification_evidence)
+    _require(
+        digest == build.prequalification_evidence_sha256,
+        "prequalification evidence digest must match its exact retained bytes",
+    )
+    _require(
+        document.evidence == declared,
+        "prequalification evidence must exactly match envelope declarations",
+    )
 
 
 async def _build_manifests(
@@ -726,6 +765,8 @@ def _envelope_dto(build: SignedBuild, envelope: CoreBuildEnvelope) -> BuildEnvel
         source=build.source,
         build_input=build.build_input,
         input_snapshot_sha256=build.input_snapshot_sha256,
+        prequalification_evidence=build.prequalification_evidence,
+        prequalification_evidence_sha256=build.prequalification_evidence_sha256,
         signature_path=build.signature_path,
         project=build.project,
         version=build.version,
@@ -756,6 +797,8 @@ def _envelope_build(envelope: BuildEnvelope) -> SignedBuild:
         input_snapshot_sha256=envelope.input_snapshot_sha256,
         artifacts=envelope.artifacts,
         sboms=envelope.sboms,
+        prequalification_evidence=envelope.prequalification_evidence,
+        prequalification_evidence_sha256=envelope.prequalification_evidence_sha256,
         signature_path=envelope.signature_path,
         project=envelope.project,
         version=envelope.version,
@@ -793,6 +836,8 @@ def _qualified_dto(envelope: BuildEnvelope, qualification: File, digest: str) ->
         qualification_sha256=digest,
         artifacts=envelope.artifacts,
         sboms=envelope.sboms,
+        prequalification_evidence=envelope.prequalification_evidence,
+        prequalification_evidence_sha256=envelope.prequalification_evidence_sha256,
     )
 
 
@@ -803,6 +848,11 @@ async def _validate_qualified(envelope: QualifiedEnvelope) -> None:
         raise InvalidIdentity("published envelope digest must match exact bytes")
     if Sha256Digest.from_bytes(qualification).value != envelope.qualification_sha256:
         raise InvalidIdentity("published qualification digest must match exact bytes")
+    _, evidence_digest = await _prequalification_document(envelope.prequalification_evidence)
+    _require(
+        evidence_digest == envelope.prequalification_evidence_sha256,
+        "published prequalification evidence digest must match exact bytes",
+    )
     await _scan_directory(envelope.artifacts)
     await _scan_directory(envelope.sboms)
 
