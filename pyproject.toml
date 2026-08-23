@@ -10,6 +10,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+  "dagger-io",
   "hypothesis>=6.140,<7",
   "mypy>=1.18,<2",
   "mutmut>=3.3,<4",
@@ -22,6 +23,9 @@ dev = [
   "xenon>=0.9.3,<1",
 ]
 
+[tool.uv.sources]
+dagger-io = { path = ".dagger/sdk", editable = true }
+
 [tool.ruff]
 target-version = "py313"
 line-length = 100
@@ -32,6 +36,8 @@ select = ["E", "F", "I", "W", "C901", "B", "UP", "SIM", "N", "RUF", "ASYNC", "S"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]
+"tests/dagger/test_module_api.py" = ["S603"]
+".dagger/src/portfolio_delivery_dagger/dto.py" = ["RUF009"]
 
 [tool.mypy]
 strict = true
@@ -52,8 +58,8 @@ also_copy = ["pyproject.toml"]
 
 [tool.poe.tasks]
 lock-check = "uv lock --check"
-typecheck = "mypy --strict src tests"
-complexity = "xenon --max-absolute A --max-modules A --max-average A src"
+typecheck = "mypy --strict src tests .dagger/src"
+complexity = "xenon --max-absolute A --max-modules A --max-average A src .dagger/src"
 test-unit = "pytest tests/unit"
 test-property = "pytest tests/property"
 test-conformance = "pytest tests/conformance"

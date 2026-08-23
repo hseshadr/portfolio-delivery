@@ -1,0 +1,14 @@
+{
+  "name": "portfolio-delivery",
+  "engineVersion": "v0.21.8",
+  "sdk": {
+    "source": "python"
+  },
+  "include": [
+    "src/**",
+    "pyproject.toml",
+    "uv.lock",
+    "toolchain.lock.toml"
+  ],
+  "source": ".dagger"
+}
