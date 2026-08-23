@@ -1,5 +1,4 @@
 """Strict Pydantic boundary documents for deterministic delivery envelopes."""
-# mypy: disable-error-code="explicit-any"
 
 from __future__ import annotations
 
@@ -19,7 +18,7 @@ QUALIFICATION_MEDIA_TYPE: Final = (
 CONFIG_MEDIA_TYPE: Final = "application/vnd.hseshadr.portfolio-delivery.config.v1+json"
 
 
-class BoundaryDocument(BaseModel):
+class BoundaryDocument(BaseModel):  # type: ignore[explicit-any]
     """The common immutable, closed-world configuration for boundary data."""
 
     model_config = ConfigDict(
@@ -27,7 +26,7 @@ class BoundaryDocument(BaseModel):
     )
 
 
-class SourceDocument(BoundaryDocument):
+class SourceDocument(BoundaryDocument):  # type: ignore[explicit-any]
     project: str
     repository: str
     protected_ref: str = Field(alias="protectedRef")
@@ -56,7 +55,7 @@ class SourceDocument(BoundaryDocument):
         return self
 
 
-class LockDocument(BoundaryDocument):
+class LockDocument(BoundaryDocument):  # type: ignore[explicit-any]
     path: str
     sha256: str
 
@@ -71,7 +70,7 @@ class LockDocument(BoundaryDocument):
         return Sha256Digest(value).value
 
 
-class ToolchainDocument(BoundaryDocument):
+class ToolchainDocument(BoundaryDocument):  # type: ignore[explicit-any]
     name: str
     version: str
     sha256: str
@@ -82,7 +81,7 @@ class ToolchainDocument(BoundaryDocument):
         return Sha256Digest(value).value
 
 
-class ArtifactDocument(BoundaryDocument):
+class ArtifactDocument(BoundaryDocument):  # type: ignore[explicit-any]
     name: str
     path: str
     media_type: str = Field(alias="mediaType")
@@ -100,7 +99,7 @@ class ArtifactDocument(BoundaryDocument):
         return Sha256Digest(value).value
 
 
-class SbomDocument(BoundaryDocument):
+class SbomDocument(BoundaryDocument):  # type: ignore[explicit-any]
     artifact_path: str = Field(alias="artifactPath")
     path: str
     media_type: str = Field(alias="mediaType")
@@ -117,7 +116,7 @@ class SbomDocument(BoundaryDocument):
         return Sha256Digest(value).value
 
 
-class EvidenceDocument(BoundaryDocument):
+class EvidenceDocument(BoundaryDocument):  # type: ignore[explicit-any]
     kind: str
     name: str
     subject: str
@@ -129,17 +128,17 @@ class EvidenceDocument(BoundaryDocument):
         return Sha256Digest(value).value
 
 
-class ReleasePolicyDocument(BoundaryDocument):
+class ReleasePolicyDocument(BoundaryDocument):  # type: ignore[explicit-any]
     version: str
     channels: tuple[str, ...]
 
 
-class CompatibilityDocument(BoundaryDocument):
+class CompatibilityDocument(BoundaryDocument):  # type: ignore[explicit-any]
     dagger: str
     oras: str
 
 
-class BuildEnvelopeDocument(BoundaryDocument):
+class BuildEnvelopeDocument(BoundaryDocument):  # type: ignore[explicit-any]
     schema_version: Literal["v1"] = Field(default="v1", alias="schemaVersion")
     source: SourceDocument
     project_adapter_version: str = Field(alias="projectAdapterVersion")
@@ -183,14 +182,40 @@ class BuildEnvelopeDocument(BoundaryDocument):
 
     @model_validator(mode="after")
     def reject_duplicate_paths(self) -> Self:
-        _reject_duplicates(tuple(item.path for item in self.artifacts))
-        _reject_duplicates(tuple(item.path for item in self.locks))
-        _reject_duplicates(tuple(item.path for item in self.sboms))
-        _reject_duplicates(tuple(item.artifact_path for item in self.sboms))
+        _reject_duplicate_build_keys(self)
         return self
 
 
-class QualificationRecordDocument(BoundaryDocument):
+def _reject_duplicate_build_keys(document: BuildEnvelopeDocument) -> None:
+    _reject_artifact_paths(document.artifacts)
+    _reject_lock_paths(document.locks)
+    _reject_toolchain_names(document.toolchains)
+    _reject_sbom_paths(document.sboms)
+    _reject_sbom_artifact_paths(document.sboms)
+    _reject_duplicate_evidence(document.prequalification_evidence)
+
+
+def _reject_artifact_paths(values: tuple[ArtifactDocument, ...]) -> None:
+    _reject_duplicates(tuple(item.path for item in values))
+
+
+def _reject_lock_paths(values: tuple[LockDocument, ...]) -> None:
+    _reject_duplicates(tuple(item.path for item in values))
+
+
+def _reject_toolchain_names(values: tuple[ToolchainDocument, ...]) -> None:
+    _reject_duplicates(tuple(item.name for item in values))
+
+
+def _reject_sbom_paths(values: tuple[SbomDocument, ...]) -> None:
+    _reject_duplicates(tuple(item.path for item in values))
+
+
+def _reject_sbom_artifact_paths(values: tuple[SbomDocument, ...]) -> None:
+    _reject_duplicates(tuple(item.artifact_path for item in values))
+
+
+class QualificationRecordDocument(BoundaryDocument):  # type: ignore[explicit-any]
     schema_version: Literal["v1"] = Field(default="v1", alias="schemaVersion")
     subject: str
     qualification_evidence: tuple[EvidenceDocument, ...] = Field(alias="qualificationEvidence")
@@ -205,8 +230,13 @@ class QualificationRecordDocument(BoundaryDocument):
     def sort_evidence(cls, values: tuple[EvidenceDocument, ...]) -> tuple[EvidenceDocument, ...]:
         return tuple(sorted(values, key=lambda item: (item.kind, item.name)))
 
+    @model_validator(mode="after")
+    def reject_duplicate_evidence(self) -> Self:
+        _reject_duplicate_evidence(self.qualification_evidence)
+        return self
 
-class OciConfigDocument(BoundaryDocument):
+
+class OciConfigDocument(BoundaryDocument):  # type: ignore[explicit-any]
     media_type: Literal["application/vnd.hseshadr.portfolio-delivery.config.v1+json"] = Field(
         default=CONFIG_MEDIA_TYPE, alias="mediaType"
     )
@@ -218,3 +248,9 @@ class OciConfigDocument(BoundaryDocument):
 def _reject_duplicates(values: tuple[str, ...]) -> None:
     if len(values) != len(set(values)):
         raise ValueError("normalized document paths must be unique")
+
+
+def _reject_duplicate_evidence(values: tuple[EvidenceDocument, ...]) -> None:
+    keys = tuple((item.kind, item.name) for item in values)
+    if len(keys) != len(set(keys)):
+        raise ValueError("evidence kind and name must be unique")

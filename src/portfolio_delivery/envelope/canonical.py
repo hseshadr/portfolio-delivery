@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from math import isfinite
 from typing import Final, cast
 
 from pydantic import BaseModel
@@ -42,9 +43,10 @@ def parse_bounded_json(content: bytes, limit: int) -> JsonObject:
     """Parse one bounded JSON object while rejecting non-finite numbers."""
 
     _validate_json_limit(content, limit)
-    value = cast(JsonValue, json.loads(content.decode("utf-8"), parse_constant=_reject_nonfinite))
+    value = _parse_json_value(content)
     if not isinstance(value, dict):
         raise ValueError("JSON content must be an object")
+    _reject_nonfinite_value(value)
     return value
 
 
@@ -53,6 +55,49 @@ def _validate_json_limit(content: bytes, limit: int) -> None:
         raise ValueError("JSON limit must be a positive integer")
     if len(content) > min(limit, MAX_JSON_BYTES):
         raise ValueError("JSON content exceeds its configured byte limit")
+
+
+def _parse_json_value(content: bytes) -> JsonValue:
+    return cast(
+        JsonValue,
+        json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonfinite,
+        ),
+    )
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, JsonValue]]) -> JsonObject:
+    result: JsonObject = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key is forbidden: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite_value(value: JsonValue) -> None:
+    _reject_nonfinite_float(value)
+    _reject_nonfinite_list(value)
+    _reject_nonfinite_object(value)
+
+
+def _reject_nonfinite_float(value: JsonValue) -> None:
+    if isinstance(value, float) and not isfinite(value):
+        raise ValueError("non-finite JSON number is forbidden")
+
+
+def _reject_nonfinite_list(value: JsonValue) -> None:
+    if isinstance(value, list):
+        for item in value:
+            _reject_nonfinite_value(item)
+
+
+def _reject_nonfinite_object(value: JsonValue) -> None:
+    if isinstance(value, dict):
+        for item in value.values():
+            _reject_nonfinite_value(item)
 
 
 def _reject_nonfinite(value: str) -> None:
