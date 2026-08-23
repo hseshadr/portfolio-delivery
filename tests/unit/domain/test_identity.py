@@ -142,3 +142,19 @@ def test_should_preserve_identity_parts_when_release_id_is_created() -> None:
     # Then
     assert release.project is project
     assert release.source_sha256 is source_digest
+
+
+@pytest.mark.parametrize(
+    ("project", "source_sha256"),
+    (
+        (cast(ProjectId, "edgeproc"), Sha256Digest("sha256:" + ("d" * 64))),
+        (ProjectId("edgeproc"), cast(Sha256Digest, "sha256:" + ("d" * 64))),
+    ),
+)
+def test_should_reject_forged_nested_identities_when_release_id_is_created(
+    project: ProjectId,
+    source_sha256: Sha256Digest,
+) -> None:
+    # Given / When / Then
+    with pytest.raises(InvalidIdentity):
+        ReleaseId(project, "v0.1.3", source_sha256, "publish-edgeproc-v0.1.3")

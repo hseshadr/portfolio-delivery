@@ -27,6 +27,21 @@ def _validate_evidence_identities(subject: object, status: object) -> None:
         raise InvalidIdentity("evidence subject and status must use domain identity records")
 
 
+def _validate_sbom_identities(artifact_path: object, path: object, digest: object) -> None:
+    if not isinstance(artifact_path, ArtifactPath):
+        raise InvalidIdentity("SBOM artifact path must use a domain identity record")
+    _validate_artifact_identities(path, digest)
+
+
+def _validate_lock_identities(path: object, digest: object) -> None:
+    _validate_artifact_identities(path, digest)
+
+
+def _validate_toolchain_digest(digest: object) -> None:
+    if not isinstance(digest, Sha256Digest):
+        raise InvalidIdentity("toolchain digest must use a domain identity record")
+
+
 def ensure_unique_artifact_paths(artifacts: tuple["Artifact", ...]) -> None:
     paths = tuple(artifact.path.value for artifact in artifacts)
     if len(paths) != len(set(paths)):
@@ -56,6 +71,7 @@ class Sbom:
     sha256: Sha256Digest
 
     def __post_init__(self) -> None:
+        _validate_sbom_identities(self.artifact_path, self.path, self.sha256)
         _require_value(self.media_type)
 
 
@@ -63,6 +79,9 @@ class Sbom:
 class LockIdentity:
     path: ArtifactPath
     sha256: Sha256Digest
+
+    def __post_init__(self) -> None:
+        _validate_lock_identities(self.path, self.sha256)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +91,7 @@ class ToolchainIdentity:
     sha256: Sha256Digest
 
     def __post_init__(self) -> None:
+        _validate_toolchain_digest(self.sha256)
         _require_value(self.name)
         _require_value(self.version)
 

@@ -103,6 +103,61 @@ def test_should_preserve_exact_lock_and_toolchain_identities_when_created() -> N
     assert toolchain.version == "3.13.14"
 
 
+@pytest.mark.parametrize(
+    ("artifact_path", "path", "sha256"),
+    (
+        (
+            cast(ArtifactPath, "dist/package.whl"),
+            ArtifactPath("sbom/package.cdx.json"),
+            make_digest("b"),
+        ),
+        (
+            ArtifactPath("dist/package.whl"),
+            cast(ArtifactPath, "sbom/package.cdx.json"),
+            make_digest("b"),
+        ),
+        (
+            ArtifactPath("dist/package.whl"),
+            ArtifactPath("sbom/package.cdx.json"),
+            cast(Sha256Digest, "sha256:" + ("b" * 64)),
+        ),
+    ),
+)
+def test_should_reject_forged_nested_identities_when_sbom_is_created(
+    artifact_path: ArtifactPath,
+    path: ArtifactPath,
+    sha256: Sha256Digest,
+) -> None:
+    # Given / When / Then
+    with pytest.raises(InvalidIdentity):
+        Sbom(artifact_path, path, "application/vnd.cyclonedx+json", sha256)
+
+
+@pytest.mark.parametrize(
+    ("path", "sha256"),
+    (
+        (cast(ArtifactPath, "uv.lock"), make_digest("c")),
+        (ArtifactPath("uv.lock"), cast(Sha256Digest, "sha256:" + ("c" * 64))),
+    ),
+)
+def test_should_reject_forged_nested_identities_when_lock_is_created(
+    path: ArtifactPath,
+    sha256: Sha256Digest,
+) -> None:
+    # Given / When / Then
+    with pytest.raises(InvalidIdentity):
+        LockIdentity(path, sha256)
+
+
+def test_should_reject_forged_digest_when_toolchain_is_created() -> None:
+    # Given
+    forged_digest = cast(Sha256Digest, "sha256:" + ("d" * 64))
+
+    # When / Then
+    with pytest.raises(InvalidIdentity):
+        ToolchainIdentity("python", "3.13.14", forged_digest)
+
+
 def test_should_preserve_check_result_when_evidence_is_created() -> None:
     # Given
     subject = make_digest("e")

@@ -46,6 +46,11 @@ def _validate_source_identities(project: object, source_digest: object) -> None:
         raise InvalidIdentity("source revision identity fields must use domain identity records")
 
 
+def _validate_release_identities(project: object, source_digest: object) -> None:
+    if not isinstance(project, ProjectId) or not isinstance(source_digest, Sha256Digest):
+        raise InvalidIdentity("release identity fields must use domain identity records")
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectId:
     value: str
@@ -101,5 +106,6 @@ class ReleaseId:
     idempotency_key: str
 
     def __post_init__(self) -> None:
+        _validate_release_identities(self.project, self.source_sha256)
         _require_identity(self.version)
         _require_identity(self.idempotency_key)
