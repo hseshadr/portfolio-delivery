@@ -8,6 +8,23 @@ from hypothesis import given
 from hypothesis import strategies as st
 from pydantic import ValidationError
 
+from portfolio_delivery.domain.artifacts import Artifact, Evidence, EvidenceStatus
+from portfolio_delivery.domain.identity import (
+    ArtifactPath,
+    ProjectId,
+    ReleaseId,
+    Sha256Digest,
+    SourceRevision,
+)
+from portfolio_delivery.domain.stages import (
+    PrequalifiedBuild,
+    ReleaseSource,
+    SignedBuild,
+    SigningDisposition,
+    SnapshottedSource,
+    UnsignedBuild,
+)
+from portfolio_delivery.envelope.builder import EnvelopeBuilder, QualificationBuilder
 from portfolio_delivery.envelope.canonical import canonical_sha256, normalize_artifact_path
 from portfolio_delivery.envelope.documents import ArtifactDocument, BuildEnvelopeDocument
 
@@ -110,3 +127,52 @@ def test_should_match_hand_calculated_golden_digest_when_fixture_is_hashed() -> 
 
     # Then
     assert digest == expected
+
+
+@given(st.sampled_from(("catalog", "catalog-next", "catalog-final")))
+def test_should_change_envelope_digest_when_signed_artifact_name_changes(name: str) -> None:
+    # Given
+    first = make_signed_build("catalog")
+    second = make_signed_build(name)
+
+    # When
+    first_digest = EnvelopeBuilder().build(first).content_sha256
+    second_digest = EnvelopeBuilder().build(second).content_sha256
+
+    # Then
+    assert (first_digest == second_digest) is (name == "catalog")
+
+
+@given(st.sampled_from((EvidenceStatus.PASSED, EvidenceStatus.FAILED)))
+def test_should_keep_envelope_digest_when_final_check_status_changes(
+    status: EvidenceStatus,
+) -> None:
+    # Given
+    envelope = EnvelopeBuilder().build(make_signed_build("catalog"))
+    check = Evidence("archive", "manifest", envelope.content_sha256, status)
+
+    # When
+    qualification = QualificationBuilder().build(envelope, (check,))
+
+    # Then
+    assert qualification.subject == envelope.content_sha256
+    assert qualification.content_sha256 != envelope.content_sha256
+
+
+def make_signed_build(name: str) -> SignedBuild:
+    project = ProjectId("catalog")
+    digest = Sha256Digest("sha256:" + ("a" * 64))
+    revision = SourceRevision(project, "hseshadr/catalog", "refs/heads/main", "b" * 40, digest)
+    release = ReleaseSource(ReleaseId(project, "v1.2.3", digest, "catalog-v1.2.3"), revision)
+    snapshot = SnapshottedSource(release, Sha256Digest("sha256:" + ("c" * 64)))
+    artifact = Artifact(
+        name,
+        ArtifactPath(f"artifacts/{name}.whl"),
+        "application/zip",
+        5,
+        Sha256Digest("sha256:" + ("d" * 64)),
+    )
+    evidence = Evidence("test", "unit", Sha256Digest("sha256:" + ("e" * 64)), EvidenceStatus.PASSED)
+    unsigned = UnsignedBuild(snapshot, (artifact,), (), (), ())
+    prequalified = PrequalifiedBuild(unsigned, (evidence,))
+    return SignedBuild(prequalified, None, SigningDisposition.SIGNING_NOT_REQUIRED)
