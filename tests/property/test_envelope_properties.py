@@ -24,9 +24,18 @@ from portfolio_delivery.domain.stages import (
     SnapshottedSource,
     UnsignedBuild,
 )
-from portfolio_delivery.envelope.builder import EnvelopeBuilder, QualificationBuilder
+from portfolio_delivery.envelope.builder import (
+    EnvelopeBuilder,
+    EnvelopeMetadata,
+    QualificationBuilder,
+)
 from portfolio_delivery.envelope.canonical import canonical_sha256, normalize_artifact_path
-from portfolio_delivery.envelope.documents import ArtifactDocument, BuildEnvelopeDocument
+from portfolio_delivery.envelope.documents import (
+    ArtifactDocument,
+    BuildEnvelopeDocument,
+    CompatibilityDocument,
+    ReleasePolicyDocument,
+)
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "envelope"
 GOLDEN_DIGEST = "sha256:0ad3c5c22295b7a43259815f9674df1321e578ac66a8b370f508bc34e8d7e31b"
@@ -136,8 +145,8 @@ def test_should_change_envelope_digest_when_signed_artifact_name_changes(name: s
     second = make_signed_build(name)
 
     # When
-    first_digest = EnvelopeBuilder().build(first).content_sha256
-    second_digest = EnvelopeBuilder().build(second).content_sha256
+    first_digest = EnvelopeBuilder(make_metadata()).build(first).content_sha256
+    second_digest = EnvelopeBuilder(make_metadata()).build(second).content_sha256
 
     # Then
     assert (first_digest == second_digest) is (name == "catalog")
@@ -148,7 +157,7 @@ def test_should_keep_envelope_digest_when_final_check_status_changes(
     status: EvidenceStatus,
 ) -> None:
     # Given
-    envelope = EnvelopeBuilder().build(make_signed_build("catalog"))
+    envelope = EnvelopeBuilder(make_metadata()).build(make_signed_build("catalog"))
     check = Evidence("archive", "manifest", envelope.content_sha256, status)
 
     # When
@@ -176,3 +185,12 @@ def make_signed_build(name: str) -> SignedBuild:
     unsigned = UnsignedBuild(snapshot, (artifact,), (), (), ())
     prequalified = PrequalifiedBuild(unsigned, (evidence,))
     return SignedBuild(prequalified, None, SigningDisposition.SIGNING_NOT_REQUIRED)
+
+
+def make_metadata() -> EnvelopeMetadata:
+    return EnvelopeMetadata(
+        "1.0.0",
+        1_724_472_000,
+        ReleasePolicyDocument(version="v1.2.3", channels=("stable",)),
+        CompatibilityDocument(dagger="0.21.8", oras="1.3.3"),
+    )

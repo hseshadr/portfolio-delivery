@@ -3,6 +3,7 @@
 import pytest
 
 from portfolio_delivery.application.foundation import FoundationDependencies, FoundationService
+from portfolio_delivery.contracts.build import Verifier
 from portfolio_delivery.contracts.storage import ArtifactStore
 from portfolio_delivery.domain.artifacts import Artifact, Evidence, EvidenceStatus
 from portfolio_delivery.domain.errors import InvalidIdentity
@@ -30,7 +31,18 @@ from portfolio_delivery.domain.stages import (
     UnsignedBuild,
     VerificationPlan,
 )
-from portfolio_delivery.envelope.builder import EnvelopeBuilder, QualificationBuilder
+from portfolio_delivery.envelope.builder import (
+    EnvelopeBuilder,
+    EnvelopeMetadata,
+    QualificationBuilder,
+)
+from portfolio_delivery.envelope.canonical import canonical_json_bytes
+from portfolio_delivery.envelope.documents import (
+    CompatibilityDocument,
+    EvidenceDocument,
+    QualificationRecordDocument,
+    ReleasePolicyDocument,
+)
 
 
 def make_digest(character: str) -> Sha256Digest:
@@ -70,6 +82,15 @@ def make_signature() -> Artifact:
         "application/signature",
         64,
         make_digest("f"),
+    )
+
+
+def make_metadata() -> EnvelopeMetadata:
+    return EnvelopeMetadata(
+        "1.0.0",
+        1_724_472_000,
+        ReleasePolicyDocument(version="v1.2.3", channels=("stable",)),
+        CompatibilityDocument(dagger="0.21.8", oras="1.3.3"),
     )
 
 
@@ -119,6 +140,90 @@ class OrderedSigner:
         return SignedBuild(build, make_signature(), SigningDisposition.SIGNED)
 
 
+class ForgedVerifier:
+    def __init__(self, prequalified: PrequalifiedBuild) -> None:
+        self.prequalified = prequalified
+
+    async def prequalify(self, build: UnsignedBuild, plan: VerificationPlan) -> PrequalifiedBuild:
+        return self.prequalified
+
+    async def qualify(self, envelope: BuildEnvelope, plan: VerificationPlan) -> QualificationRecord:
+        document = QualificationRecordDocument(
+            subject=envelope.content_sha256.value,
+            qualificationEvidence=(
+                EvidenceDocument(
+                    kind="archive",
+                    name="manifest",
+                    subject=make_digest("9").value,
+                    status="passed",
+                ),
+            ),
+        )
+        canonical_bytes = canonical_json_bytes(document)
+        return QualificationRecord(
+            envelope.content_sha256,
+            document,
+            canonical_bytes,
+            Sha256Digest.from_bytes(canonical_bytes),
+        )
+
+
+class MalformedVerifier:
+    def __init__(self, prequalified: PrequalifiedBuild) -> None:
+        self.prequalified = prequalified
+
+    async def prequalify(self, build: UnsignedBuild, plan: VerificationPlan) -> PrequalifiedBuild:
+        return self.prequalified
+
+    async def qualify(self, envelope: BuildEnvelope, plan: VerificationPlan) -> QualificationRecord:
+        canonical_bytes = b"{}\n"
+        return QualificationRecord(
+            envelope.content_sha256,
+            object(),
+            canonical_bytes,
+            Sha256Digest.from_bytes(canonical_bytes),
+        )
+
+
+class NoncanonicalVerifier:
+    def __init__(self, prequalified: PrequalifiedBuild) -> None:
+        self.prequalified = prequalified
+
+    async def prequalify(self, build: UnsignedBuild, plan: VerificationPlan) -> PrequalifiedBuild:
+        return self.prequalified
+
+    async def qualify(self, envelope: BuildEnvelope, plan: VerificationPlan) -> QualificationRecord:
+        document = QualificationRecordDocument(
+            subject=envelope.content_sha256.value,
+            qualificationEvidence=(),
+        )
+        canonical_bytes = b"{}\n"
+        return QualificationRecord(
+            envelope.content_sha256,
+            document,
+            canonical_bytes,
+            Sha256Digest.from_bytes(canonical_bytes),
+        )
+
+
+class WrongSubjectVerifier:
+    def __init__(self, prequalified: PrequalifiedBuild) -> None:
+        self.prequalified = prequalified
+
+    async def prequalify(self, build: UnsignedBuild, plan: VerificationPlan) -> PrequalifiedBuild:
+        return self.prequalified
+
+    async def qualify(self, envelope: BuildEnvelope, plan: VerificationPlan) -> QualificationRecord:
+        document = QualificationRecordDocument(
+            subject=make_digest("9").value,
+            qualificationEvidence=(),
+        )
+        canonical_bytes = canonical_json_bytes(document)
+        return QualificationRecord(
+            make_digest("9"), document, canonical_bytes, Sha256Digest.from_bytes(canonical_bytes)
+        )
+
+
 class RecordingStore:
     def __init__(self) -> None:
         self.bundle: EnvelopeBundle | None = None
@@ -139,17 +244,20 @@ class RecordingStore:
         return self.bundle
 
 
-def make_service(events: list[str], store: ArtifactStore) -> FoundationService:
+def make_service(
+    events: list[str], store: ArtifactStore, verifier: Verifier | None = None
+) -> FoundationService:
     prequalified = make_prequalified()
+    selected_verifier = verifier or OrderedVerifier(events, prequalified)
     return FoundationService(
         FoundationDependencies(
             OrderedSnapshotter(events, prequalified.unsigned.source),
             OrderedBuilder(events, prequalified.unsigned),
-            OrderedVerifier(events, prequalified),
+            selected_verifier,
             OrderedSigner(events),
             store,
         ),
-        EnvelopeBuilder(),
+        EnvelopeBuilder(make_metadata()),
     )
 
 
@@ -235,3 +343,92 @@ async def test_should_reject_empty_attempt_before_store_persistence() -> None:
     with pytest.raises(InvalidIdentity, match="attempt ID"):
         await service.persist(qualified, "")
     assert store.bundle is None
+
+
+async def test_should_reject_forged_final_evidence_subject_when_verifier_qualifies() -> None:
+    # Given
+    events: list[str] = []
+    prequalified = make_prequalified()
+    service = make_service(events, RecordingStore(), ForgedVerifier(prequalified))
+
+    # When / Then
+    with pytest.raises(InvalidIdentity, match="final envelope digest"):
+        await service.qualify(
+            make_source(),
+            InputSnapshotPlan(("src",)),
+            BuildPlan("build", ("uv build",)),
+            SigningPolicy.none(),
+            VerificationPlan(("archive",)),
+        )
+
+
+async def test_should_reject_unexpected_qualification_document_when_verifier_qualifies() -> None:
+    # Given
+    events: list[str] = []
+    prequalified = make_prequalified()
+    service = make_service(events, RecordingStore(), MalformedVerifier(prequalified))
+
+    # When / Then
+    with pytest.raises(InvalidIdentity, match="qualification document"):
+        await service.qualify(
+            make_source(),
+            InputSnapshotPlan(("src",)),
+            BuildPlan("build", ("uv build",)),
+            SigningPolicy.none(),
+            VerificationPlan(("archive",)),
+        )
+
+
+async def test_should_reject_noncanonical_qualification_bytes_when_verifier_qualifies() -> None:
+    # Given
+    events: list[str] = []
+    prequalified = make_prequalified()
+    service = make_service(events, RecordingStore(), NoncanonicalVerifier(prequalified))
+
+    # When / Then
+    with pytest.raises(InvalidIdentity, match="bytes must match"):
+        await service.qualify(
+            make_source(),
+            InputSnapshotPlan(("src",)),
+            BuildPlan("build", ("uv build",)),
+            SigningPolicy.none(),
+            VerificationPlan(("archive",)),
+        )
+
+
+async def test_should_reject_wrong_qualification_subject_when_verifier_qualifies() -> None:
+    # Given
+    events: list[str] = []
+    prequalified = make_prequalified()
+    service = make_service(events, RecordingStore(), WrongSubjectVerifier(prequalified))
+
+    # When / Then
+    with pytest.raises(InvalidIdentity, match="final envelope digest"):
+        await service.qualify(
+            make_source(),
+            InputSnapshotPlan(("src",)),
+            BuildPlan("build", ("uv build",)),
+            SigningPolicy.none(),
+            VerificationPlan(("archive",)),
+        )
+
+
+async def test_should_include_signature_in_bundle_when_signed_envelope_persists() -> None:
+    # Given
+    events: list[str] = []
+    store = RecordingStore()
+    service = make_service(events, store)
+    qualified = await service.qualify(
+        make_source(),
+        InputSnapshotPlan(("src",)),
+        BuildPlan("build", ("uv build",)),
+        SigningPolicy.required("catalog-key"),
+        VerificationPlan(("archive",)),
+    )
+
+    # When
+    await service.persist(qualified, "attempt-1")
+
+    # Then
+    assert store.bundle is not None
+    assert tuple(artifact.name for artifact in store.bundle.artifacts) == ("catalog", "signature")

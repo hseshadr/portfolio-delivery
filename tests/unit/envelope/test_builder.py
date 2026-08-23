@@ -1,6 +1,7 @@
 """Behavioral tests for final envelope and detached qualification builders."""
 
-from typing import cast
+from collections.abc import Callable
+from typing import Final, cast
 
 import pytest
 
@@ -28,8 +29,18 @@ from portfolio_delivery.domain.stages import (
     SnapshottedSource,
     UnsignedBuild,
 )
-from portfolio_delivery.envelope.builder import EnvelopeBuilder, QualificationBuilder
-from portfolio_delivery.envelope.documents import BuildEnvelopeDocument
+from portfolio_delivery.envelope.builder import (
+    EnvelopeBuilder,
+    EnvelopeMetadata,
+    QualificationBuilder,
+)
+from portfolio_delivery.envelope.documents import (
+    BuildEnvelopeDocument,
+    CompatibilityDocument,
+    ReleasePolicyDocument,
+)
+
+SOURCE_DATE_EPOCH: Final[int] = 1_724_472_000
 
 
 def make_digest(character: str) -> Sha256Digest:
@@ -74,9 +85,18 @@ def make_final_check(envelope_digest: Sha256Digest, status: EvidenceStatus) -> E
     return Evidence("archive", "manifest", envelope_digest, status)
 
 
+def make_metadata() -> EnvelopeMetadata:
+    return EnvelopeMetadata(
+        "1.0.0",
+        SOURCE_DATE_EPOCH,
+        ReleasePolicyDocument(version="v1.2.3", channels=("stable",)),
+        CompatibilityDocument(dagger="0.21.8", oras="1.3.3"),
+    )
+
+
 def test_should_keep_envelope_digest_when_final_checks_change() -> None:
     # Given
-    envelope = EnvelopeBuilder().build(make_signed_build())
+    envelope = EnvelopeBuilder(make_metadata()).build(make_signed_build())
     first_checks = (make_final_check(envelope.content_sha256, EvidenceStatus.PASSED),)
     second_checks = (make_final_check(envelope.content_sha256, EvidenceStatus.FAILED),)
 
@@ -95,7 +115,7 @@ def test_should_include_signature_when_signed_build_is_assembled() -> None:
     signed = make_signed_build()
 
     # When
-    envelope = EnvelopeBuilder().build(signed)
+    envelope = EnvelopeBuilder(make_metadata()).build(signed)
 
     # Then
     assert isinstance(envelope.document, BuildEnvelopeDocument)
@@ -109,8 +129,8 @@ def test_should_change_envelope_digest_when_signed_artifact_changes() -> None:
     second_signed = make_signed_build("catalog-next")
 
     # When
-    first = EnvelopeBuilder().build(first_signed)
-    second = EnvelopeBuilder().build(second_signed)
+    first = EnvelopeBuilder(make_metadata()).build(first_signed)
+    second = EnvelopeBuilder(make_metadata()).build(second_signed)
 
     # Then
     assert first.content_sha256 != second.content_sha256
@@ -135,7 +155,7 @@ def test_should_serialize_signed_build_components_when_envelope_is_assembled() -
     )
 
     # When
-    envelope = EnvelopeBuilder().build(signed)
+    envelope = EnvelopeBuilder(make_metadata()).build(signed)
 
     # Then
     assert isinstance(envelope.document, BuildEnvelopeDocument)
@@ -147,7 +167,7 @@ def test_should_serialize_signed_build_components_when_envelope_is_assembled() -
 
 def test_should_reject_check_with_nonfinal_envelope_subject() -> None:
     # Given
-    envelope = EnvelopeBuilder().build(make_signed_build())
+    envelope = EnvelopeBuilder(make_metadata()).build(make_signed_build())
     invalid_check = Evidence("archive", "manifest", make_digest("9"), EvidenceStatus.PASSED)
 
     # When / Then
@@ -157,9 +177,79 @@ def test_should_reject_check_with_nonfinal_envelope_subject() -> None:
 
 def test_should_reject_non_evidence_check_when_qualification_is_assembled() -> None:
     # Given
-    envelope = EnvelopeBuilder().build(make_signed_build())
+    envelope = EnvelopeBuilder(make_metadata()).build(make_signed_build())
     invalid_checks = cast(tuple[Evidence, ...], ("not-evidence",))
 
     # When / Then
     with pytest.raises(InvalidIdentity, match="evidence records"):
         QualificationBuilder().build(envelope, invalid_checks)
+
+
+def test_should_use_declared_metadata_when_envelope_is_assembled() -> None:
+    # Given
+    metadata = make_metadata()
+
+    # When
+    envelope = EnvelopeBuilder(metadata).build(make_signed_build())
+
+    # Then
+    assert isinstance(envelope.document, BuildEnvelopeDocument)
+    assert envelope.document.project_adapter_version == "1.0.0"
+    assert envelope.document.source_date_epoch == SOURCE_DATE_EPOCH
+    assert envelope.document.release_policy.channels == ("stable",)
+    assert envelope.document.compatibility.dagger == "0.21.8"
+    assert envelope.document.compatibility.oras == "1.3.3"
+
+
+def test_should_require_declared_metadata_when_builder_is_created() -> None:
+    # Given
+    factory = cast(Callable[[], EnvelopeBuilder], EnvelopeBuilder)
+
+    # When / Then
+    with pytest.raises(TypeError):
+        factory()
+
+
+def test_should_reject_policy_that_disagrees_with_release_when_envelope_is_assembled() -> None:
+    # Given
+    metadata = EnvelopeMetadata(
+        "1.0.0",
+        SOURCE_DATE_EPOCH,
+        ReleasePolicyDocument(version="v9.9.9", channels=("stable",)),
+        CompatibilityDocument(dagger="0.21.8", oras="1.3.3"),
+    )
+
+    # When / Then
+    with pytest.raises(InvalidIdentity, match="match the release version"):
+        EnvelopeBuilder(metadata).build(make_signed_build())
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    (
+        lambda: EnvelopeMetadata(
+            "not-recorded",
+            1_724_472_000,
+            ReleasePolicyDocument(version="v1.2.3", channels=("stable",)),
+            CompatibilityDocument(dagger="0.21.8", oras="1.3.3"),
+        ),
+        lambda: EnvelopeMetadata(
+            "1.0.0",
+            0,
+            ReleasePolicyDocument(version="v1.2.3", channels=("stable",)),
+            CompatibilityDocument(dagger="0.21.8", oras="1.3.3"),
+        ),
+        lambda: EnvelopeMetadata(
+            "1.0.0",
+            1_724_472_000,
+            ReleasePolicyDocument(version="v1.2.3", channels=()),
+            CompatibilityDocument(dagger="0.21.8", oras="1.3.3"),
+        ),
+    ),
+)
+def test_should_reject_incomplete_declared_metadata_when_created(
+    metadata: Callable[[], EnvelopeMetadata],
+) -> None:
+    # Given / When / Then
+    with pytest.raises(InvalidIdentity):
+        metadata()
