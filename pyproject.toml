@@ -5,11 +5,12 @@ requires-python = ">=3.13,<3.14"
 dependencies = ["pydantic>=2.12,<3"]
 
 [build-system]
-requires = ["uv_build>=0.8.4,<0.9.0"]
+requires = ["uv_build==0.8.24"]
 build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+  "cyclonedx-python-lib[json-validation]==11.12.0",
   "dagger-io",
   "hypothesis>=6.140,<7",
   "mypy>=1.18,<2",

@@ -37,7 +37,7 @@ from portfolio_delivery.envelope.canonical import canonical_sha256, normalize_ar
 from portfolio_delivery.envelope.documents import ArtifactDocument, BuildEnvelopeDocument
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "envelope"
-GOLDEN_DIGEST = "sha256:0ad3c5c22295b7a43259815f9674df1321e578ac66a8b370f508bc34e8d7e31b"
+GOLDEN_DIGEST = "sha256:785da43a6ba76078c3b49ffce62f4badd23656bb3acb0981692ef6b820c63b63"
 
 
 def fixture_bytes(relative_path: str) -> bytes:

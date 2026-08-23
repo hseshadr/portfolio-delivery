@@ -151,6 +151,17 @@ def _is_template_rendering(node: ast.AST) -> bool:
         and value.func.attr == "format"
         and isinstance(value.func.value, ast.Name)
         and value.func.value.id.endswith("_TEMPLATE")
+        and not value.args
+        and bool(value.keywords)
+        and all(_is_matching_name_keyword(keyword) for keyword in value.keywords)
+    )
+
+
+def _is_matching_name_keyword(keyword: ast.keyword) -> bool:
+    return (
+        keyword.arg is not None
+        and isinstance(keyword.value, ast.Name)
+        and keyword.arg == keyword.value.id
     )
 
 
@@ -240,6 +251,18 @@ def test_should_detect_aliased_or_nested_forbidden_import(
         ("raise RuntimeError(\n    execute()  # pragma: no mutate\n)\n", 2),
         ("return_value = RuntimeError(\n    _MESSAGE  # pragma: no mutate\n)\n", 2),
         ("raise RuntimeError(\n    _MESSAGE,  # pragma: no mutate\n    code,\n)\n", 2),
+        (
+            "_diagnostic_message = _TEMPLATE.format(name=execute_release())  # pragma: no mutate\n",
+            1,
+        ),
+        (
+            "_diagnostic_message = _TEMPLATE.format(name=release.name)  # pragma: no mutate\n",
+            1,
+        ),
+        ("_diagnostic_message = _TEMPLATE.format(name=other)  # pragma: no mutate\n", 1),
+        ("_diagnostic_message = _TEMPLATE.format(name)  # pragma: no mutate\n", 1),
+        ("_diagnostic_message = _TEMPLATE.format(*names)  # pragma: no mutate\n", 1),
+        ("_diagnostic_message = _TEMPLATE.format(**values)  # pragma: no mutate\n", 1),
     ),
 )
 def test_should_reject_suppression_of_mutable_behavior(

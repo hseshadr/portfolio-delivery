@@ -472,6 +472,7 @@ requires-dist = [{ name = "pydantic", specifier = ">=2.12,<3" }]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "cyclonedx-python-lib", extras = ["json-validation"], specifier = "==11.12.0" },
     { name = "dagger-io", editable = "sdk" },
     { name = "hypothesis", specifier = ">=6.140,<7" },
     { name = "mutmut", specifier = ">=3.3,<4" },

@@ -33,8 +33,8 @@
       "name": "package",
       "path": "artifacts/package.whl",
       "mediaType": "application/vnd.python.wheel",
-      "size": 35,
-      "sha256": "sha256:7ec0825fecd2815f0ad4b77bfce900fc3ddafd63189323706ac498e7bd4d1b33"
+      "size": 30894,
+      "sha256": "sha256:791b7e80515490349592762d739f03fdff329336f63324b3eeb4261bc315bdcd"
     },
     {
       "name": "alpha",
@@ -49,7 +49,7 @@
       "artifactPath": "artifacts/package.whl",
       "path": "sbom/package.cdx.json",
       "mediaType": "application/vnd.cyclonedx+json",
-      "sha256": "sha256:726c2214edb4ee286759394e9048e7105e534dce6a8e3c462cf9b7829007ddc1"
+      "sha256": "sha256:6cd751513f5eae9aade59a0f042a886a6b71174b04f0d1c969be808c42e35af3"
     }
   ],
   "prequalificationEvidence": [

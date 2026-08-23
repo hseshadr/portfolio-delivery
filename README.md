@@ -41,7 +41,8 @@ through narrow contracts and composed adapters, so adding another project does n
 
 ## Prerequisites and exact pins
 
-- Python `3.13.14` and `uv` on `PATH`.
+- Python `3.13.14` and `uv` on `PATH`; wheels use the exact `uv_build==0.8.24` backend.
+- CycloneDX Python Library `11.12.0` with its official JSON validator (locked development tool).
 - Dagger CLI `v0.21.8`; the module also declares engine `v0.21.8`.
 - A local Dagger-compatible container runtime and network access for the first pinned image pull.
 - ORAS `v1.3.3` from
@@ -84,8 +85,28 @@ The demo consumes the checked-in wheel, CycloneDX 1.6 SBOM, and prequalification
 creates the envelope, attaches detached qualification, performs two identical persistence
 attempts, restores exact bytes, and owns the Registry service lifecycle.
 
+The wheel is a real `py3-none-any` archive containing the importable `portfolio_delivery` package,
+not placeholder bytes. Its CycloneDX component records the same project name and version, a purl,
+and the wheel SHA-256. Unit tests rebuild the wheel in two independent clean source directories,
+regenerate the SBOM twice with the official library, require byte-identical output, validate the
+CycloneDX 1.6 schema, and verify the build-input declarations against both files.
+
 ```bash
 uv run poe demo-local-oci
+```
+
+To regenerate only the reviewed wheel and its deterministic SBOM after an intentional source
+change, use the pinned backend and the envelope's fixed epoch; the semantic fixture test then
+fails until the reviewed build-input and golden envelope declarations are updated:
+
+```bash
+SOURCE_DATE_EPOCH=1724472000 uv build --wheel --no-sources --out-dir dist .
+cp dist/portfolio_delivery-0.1.0-py3-none-any.whl tests/fixtures/envelope/input/artifacts/package.whl
+uv run python scripts/build-release-sbom.py \
+  --wheel tests/fixtures/envelope/input/artifacts/package.whl \
+  --output tests/fixtures/envelope/input/sbom/package.cdx.json \
+  --source-date-epoch 1724472000
+uv run pytest -q tests/unit/test_release_fixtures.py tests/unit/envelope/test_canonical.py
 ```
 
 The output is one canonical JSON object with this bounded shape:
