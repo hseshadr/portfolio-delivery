@@ -579,6 +579,7 @@ def _blob_fetch(reference: str) -> OrasInvocation:
 
 
 def _manifest_stdout_or_none(result: OrasResult) -> bytes | None:
+    _require_no_exported_file(result)
     _require_bounded_outputs(result, MAX_MANIFEST_BYTES)
     if result.outcome is OrasOutcome.SUCCESS:
         return result.stdout
@@ -588,6 +589,7 @@ def _manifest_stdout_or_none(result: OrasResult) -> bytes | None:
 
 
 def _successful_stdout(result: OrasResult, limit: int) -> bytes:
+    _require_no_exported_file(result)
     _require_bounded_outputs(result, limit)
     if result.outcome is not OrasOutcome.SUCCESS:
         _raise_result_error(result)
@@ -601,6 +603,11 @@ def _successful_exported_file(result: OrasResult) -> bytes:
     if result.exported_file_bytes is None:
         raise MalformedProviderResponse("ORAS push omitted its exported manifest bytes")
     return _bounded_export(result.exported_file_bytes)
+
+
+def _require_no_exported_file(result: OrasResult) -> None:
+    if result.exported_file_bytes is not None:
+        raise MalformedProviderResponse("non-push ORAS result carried an unexpected exported file")
 
 
 def _require_bounded_outputs(result: OrasResult, stdout_limit: int) -> None:
@@ -664,6 +671,18 @@ def _require_unique_layer_titles(layers: tuple[_Descriptor, ...]) -> None:
     titles = tuple(item.title for item in layers)
     if None in titles or len(titles) != len(set(titles)):
         raise MalformedProviderResponse("OCI manifest has missing or duplicate layer titles")
+    for title in titles:
+        _require_canonical_layer_title(title)
+
+
+def _require_canonical_layer_title(title: str | None) -> None:
+    if title is None or len(title) > MAX_PATH_LENGTH:
+        raise MalformedProviderResponse("OCI layer title must be bounded and canonical")
+    try:
+        ArtifactPath(title)
+    except ValueError as error:
+        message = "OCI layer title must be a canonical relative path"
+        raise MalformedProviderResponse(message) from error
 
 
 def _require_declared_manifest(reference: OciReference, digest: Sha256Digest) -> None:

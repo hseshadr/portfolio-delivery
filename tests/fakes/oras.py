@@ -47,6 +47,8 @@ class FakeOrasRunner:
         self.push_stdout = b"pushed"
         self.push_stderr = b""
         self.exported_file_override: bytes | None = None
+        self.manifest_exported_file_bytes: bytes | None = None
+        self.blob_exported_file_bytes: bytes | None = None
         self.missing_outcome = OrasOutcome.NOT_FOUND
         self.missing_stdout = b""
         self.missing_stderr = b"manifest unavailable"
@@ -113,14 +115,14 @@ class FakeOrasRunner:
             )
         if "@sha256:" in reference and self.digest_manifest_override is not None:
             content = self.digest_manifest_override
-        return OrasResult(0, OrasOutcome.SUCCESS, content, b"")
+        return OrasResult(0, OrasOutcome.SUCCESS, content, b"", self.manifest_exported_file_bytes)
 
     def _fetch_blob(self, reference: str) -> OrasResult:
         self.observation_count += 1
         content = self.blobs.get(reference)
         if content is None:
             return OrasResult(1, OrasOutcome.NOT_FOUND, b"", b"blob unavailable")
-        return OrasResult(0, OrasOutcome.SUCCESS, content, b"")
+        return OrasResult(0, OrasOutcome.SUCCESS, content, b"", self.blob_exported_file_bytes)
 
 
 def _planned_input_paths() -> tuple[str, ...]:

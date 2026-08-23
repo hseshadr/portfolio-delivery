@@ -461,6 +461,19 @@ async def test_should_reject_noncanonical_manifest_descriptor(mutation: str) -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("layer", ("artifact", "sbom"))
+async def test_should_reject_absolute_non_core_layer_title(layer: str) -> None:
+    scenario = make_scenario()
+    await scenario.adapter.persist(scenario.bundle, "attempt-seed")
+    reference = f"{REPOSITORY}:{content_reference(scenario.bundle).tag}"
+    content = mutate_non_core_title(scenario.runner.manifests[reference], layer)
+    scenario.runner.put_manifest(reference, content)
+
+    with pytest.raises(MalformedProviderResponse, match="title"):
+        await scenario.adapter.inspect(content_reference(scenario.bundle), "attempt-layer-title")
+
+
+@pytest.mark.asyncio
 async def test_should_reject_remote_manifest_that_differs_at_digest_reference() -> None:
     scenario = make_scenario()
     await scenario.adapter.persist(scenario.bundle, "attempt-seed")
@@ -554,6 +567,33 @@ async def test_should_bound_stdout_even_when_provider_fails() -> None:
 
     with pytest.raises(MalformedProviderResponse, match="stdout"):
         await scenario.adapter.inspect(content_reference(scenario.bundle), "attempt-stdout-bound")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exported", (b"unexpected", b"x" * (MAX_MANIFEST_BYTES + 1)), ids=("small", "oversized")
+)
+async def test_should_reject_exported_file_on_manifest_fetch(exported: bytes) -> None:
+    scenario = make_scenario()
+    await scenario.adapter.persist(scenario.bundle, "attempt-seed")
+    scenario.runner.manifest_exported_file_bytes = exported
+
+    with pytest.raises(MalformedProviderResponse, match="exported file"):
+        reference = content_reference(scenario.bundle)
+        await scenario.adapter.inspect(reference, "attempt-manifest-export")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exported", (b"unexpected", b"x" * (MAX_MANIFEST_BYTES + 1)), ids=("small", "oversized")
+)
+async def test_should_reject_exported_file_on_blob_fetch(exported: bytes) -> None:
+    scenario = make_scenario()
+    await scenario.adapter.persist(scenario.bundle, "attempt-seed")
+    scenario.runner.blob_exported_file_bytes = exported
+
+    with pytest.raises(MalformedProviderResponse, match="exported file"):
+        await scenario.adapter.persist(scenario.bundle, "attempt-blob-export")
 
 
 @pytest.mark.asyncio
@@ -677,4 +717,13 @@ def mutate_descriptor(content: bytes, mutation: str) -> bytes:
 def mutate_sbom_size(content: bytes, size: int) -> bytes:
     document = json.loads(content)
     document["layers"][-1]["size"] = size
+    return json.dumps(document, separators=(",", ":"), sort_keys=True).encode()
+
+
+def mutate_non_core_title(content: bytes, layer: str) -> bytes:
+    document = json.loads(content)
+    index = -2 if layer == "artifact" else -1
+    descriptor = document["layers"][index]
+    title = descriptor["annotations"]["org.opencontainers.image.title"]
+    descriptor["annotations"]["org.opencontainers.image.title"] = f"/work/{title}"
     return json.dumps(document, separators=(",", ":"), sort_keys=True).encode()
