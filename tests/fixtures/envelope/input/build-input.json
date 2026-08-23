@@ -1,0 +1,71 @@
+{
+  "source": {
+    "project": "portfolio-delivery",
+    "repository": "hseshadr/portfolio-delivery",
+    "protectedRef": "refs/heads/main",
+    "commitSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sourceTreeSha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "projectAdapterVersion": "1.0.0",
+  "sourceDateEpoch": 1724472000,
+  "locks": [
+    {
+      "path": "uv.lock",
+      "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "toolchains": [
+    {
+      "name": "python",
+      "version": "3.13.14",
+      "sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    }
+  ],
+  "artifacts": [
+    {
+      "name": "zeta",
+      "path": "artifacts/zeta.txt",
+      "mediaType": "text/plain",
+      "size": 1,
+      "sha256": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+    },
+    {
+      "name": "package",
+      "path": "artifacts/package.whl",
+      "mediaType": "application/vnd.python.wheel",
+      "size": 35,
+      "sha256": "sha256:7ec0825fecd2815f0ad4b77bfce900fc3ddafd63189323706ac498e7bd4d1b33"
+    },
+    {
+      "name": "alpha",
+      "path": "artifacts/alpha.txt",
+      "mediaType": "text/plain",
+      "size": 1,
+      "sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  ],
+  "sboms": [
+    {
+      "artifactPath": "artifacts/package.whl",
+      "path": "sbom/package.cdx.json",
+      "mediaType": "application/vnd.cyclonedx+json",
+      "sha256": "sha256:726c2214edb4ee286759394e9048e7105e534dce6a8e3c462cf9b7829007ddc1"
+    }
+  ],
+  "prequalificationEvidence": [
+    {
+      "kind": "test",
+      "name": "unit",
+      "subject": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "status": "passed"
+    }
+  ],
+  "releasePolicy": {
+    "version": "v0.1.0",
+    "channels": ["stable"]
+  },
+  "compatibility": {
+    "dagger": "0.21.8",
+    "oras": "1.3.3"
+  }
+}
