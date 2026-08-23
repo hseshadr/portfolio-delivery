@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from dagger import Directory, File, field, object_type
+from dagger import Directory, File, field, function, object_type
+
+from portfolio_delivery_dagger.plan import InputSnapshotPlan
 
 
 @dataclass(kw_only=True)
@@ -18,16 +20,27 @@ class CheckEvidence:
 
 @dataclass(kw_only=True)
 @object_type
-class ReleaseSource:
+class ReleaseSource(InputSnapshotPlan):
     """A validated source revision paired with its explicit directory."""
 
     source: Directory = field()
+    inventory: File = field()
+    includes: list[str] = field()
+    excludes: list[str] = field()
     project: str = field()
     version: str = field()
     repository: str = field()
     protected_ref: str = field()
     commit_sha: str = field()
     source_tree_sha256: str = field()
+
+    @function
+    def include_paths(self) -> list[str]:
+        return list(self.includes)
+
+    @function
+    def exclude_paths(self) -> list[str]:
+        return list(self.excludes)
 
 
 @dataclass(kw_only=True)
@@ -38,6 +51,12 @@ class SnapshottedSource:
     source: Directory = field()
     manifest: File = field()
     input_snapshot_sha256: str = field()
+    project: str = field()
+    version: str = field()
+    repository: str = field()
+    protected_ref: str = field()
+    commit_sha: str = field()
+    source_tree_sha256: str = field()
 
 
 @dataclass(kw_only=True)
@@ -50,6 +69,12 @@ class UnsignedBuild:
     input_snapshot_sha256: str = field()
     artifacts: Directory = field()
     sboms: Directory = field()
+    project: str = field()
+    version: str = field()
+    repository: str = field()
+    protected_ref: str = field()
+    commit_sha: str = field()
+    source_tree_sha256: str = field()
 
 
 @dataclass(kw_only=True)
@@ -62,6 +87,12 @@ class PrequalifiedBuild:
     input_snapshot_sha256: str = field()
     artifacts: Directory = field()
     sboms: Directory = field()
+    project: str = field()
+    version: str = field()
+    repository: str = field()
+    protected_ref: str = field()
+    commit_sha: str = field()
+    source_tree_sha256: str = field()
 
 
 @dataclass(kw_only=True)
@@ -75,6 +106,12 @@ class SignedBuild:
     artifacts: Directory = field()
     sboms: Directory = field()
     signature_path: str | None = field()
+    project: str = field()
+    version: str = field()
+    repository: str = field()
+    protected_ref: str = field()
+    commit_sha: str = field()
+    source_tree_sha256: str = field()
 
 
 @dataclass(kw_only=True)
@@ -86,6 +123,16 @@ class BuildEnvelope:
     envelope_sha256: str = field()
     artifacts: Directory = field()
     sboms: Directory = field()
+    source: Directory = field()
+    build_input: File = field()
+    input_snapshot_sha256: str = field()
+    signature_path: str | None = field()
+    project: str = field()
+    version: str = field()
+    repository: str = field()
+    protected_ref: str = field()
+    commit_sha: str = field()
+    source_tree_sha256: str = field()
 
 
 @dataclass(kw_only=True)

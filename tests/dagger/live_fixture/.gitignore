@@ -1,0 +1,5 @@
+/.venv/
+/sdk/
+/uv.lock
+/**/__pycache__/
+/.env

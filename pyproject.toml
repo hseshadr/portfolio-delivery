@@ -29,7 +29,7 @@ dagger-io = { path = ".dagger/sdk", editable = true }
 [tool.ruff]
 target-version = "py313"
 line-length = 100
-extend-exclude = [".dagger/sdk"]
+extend-exclude = [".dagger/sdk", "tests/dagger/live_fixture"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "C901", "B", "UP", "SIM", "N", "RUF", "ASYNC", "S", "PL"]
@@ -44,7 +44,7 @@ strict = true
 python_version = "3.13"
 warn_unreachable = true
 disallow_any_explicit = true
-exclude = '^\.dagger/sdk/'
+exclude = '^(\.dagger/sdk/|tests/dagger/live_fixture/)'
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

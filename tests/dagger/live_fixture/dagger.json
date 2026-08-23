@@ -1,0 +1,13 @@
+{
+  "name": "task7-live-fixture",
+  "engineVersion": "v0.21.8",
+  "sdk": {
+    "source": "python"
+  },
+  "dependencies": [
+    {
+      "name": "portfolio-delivery",
+      "source": "../../.."
+    }
+  ]
+}
