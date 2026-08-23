@@ -32,9 +32,14 @@ from portfolio_delivery.envelope.documents import (
 )
 
 _SEMVER: Final = re.compile(
-    r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    r"(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
 )
-_RELEASE_VERSION: Final = re.compile(rf"v{_SEMVER.pattern}")
+_PLACEHOLDER_IDENTIFIER: Final = re.compile(
+    r"(?:^|[.+-])(?:tbd|todo|unknown|not-recorded)(?=$|[.+-])", re.IGNORECASE
+)
 PINNED_DAGGER_VERSION: Final[str] = "0.21.8"
 PINNED_ORAS_VERSION: Final[str] = "1.3.3"
 
@@ -244,11 +249,14 @@ def _require_contract_type(value: object, expected_type: type[object]) -> None:
 def _require_semver(value: str, name: str) -> None:
     if not isinstance(value, str) or _SEMVER.fullmatch(value) is None:
         raise InvalidIdentity(f"{name} must be canonical semantic version text")
+    if _PLACEHOLDER_IDENTIFIER.search(value) is not None:
+        raise InvalidIdentity(f"{name} cannot contain placeholder identifiers")
 
 
 def _require_release_version(value: str) -> None:
-    if not isinstance(value, str) or _RELEASE_VERSION.fullmatch(value) is None:
+    if not isinstance(value, str) or not value.startswith("v"):
         raise InvalidIdentity("release policy version must be v-prefixed semantic version")
+    _require_semver(value[1:], "release policy version")
 
 
 def _require_release_channels(channels: object) -> None:

@@ -244,6 +244,43 @@ def test_should_reject_nonpinned_metadata_values_when_created(
 
 
 @pytest.mark.parametrize(
+    "factory",
+    (
+        lambda: ProjectAdapterVersion("1.0.0-tbd"),
+        lambda: ProjectAdapterVersion("1.0.0-01"),
+        lambda: ProjectAdapterVersion("1٢.0.0"),
+        lambda: ProjectAdapterVersion("1.0.0-alpha.todo"),
+        lambda: ProjectAdapterVersion("1.0.0+not-recorded"),
+        lambda: ReleasePolicyMetadata("v1.2.3-01", (ReleaseChannel.STABLE,)),
+        lambda: ReleasePolicyMetadata("v1.2.3-TBD", (ReleaseChannel.STABLE,)),
+    ),
+)
+def test_should_reject_noncanonical_or_placeholder_semver_when_created(
+    factory: Callable[[], object],
+) -> None:
+    # Given / When / Then
+    with pytest.raises(InvalidIdentity):
+        factory()
+
+
+@pytest.mark.parametrize("value", ("1.0.0-alpha.1+build.7", "2.4.6-rc.1"))
+def test_should_allow_strict_semver_prerelease_when_adapter_version_is_created(value: str) -> None:
+    # Given / When
+    version = ProjectAdapterVersion(value)
+
+    # Then
+    assert version.value == value
+
+
+def test_should_allow_strict_semver_prerelease_when_release_policy_is_created() -> None:
+    # Given / When
+    policy = ReleasePolicyMetadata("v1.2.3-beta.1+build.7", (ReleaseChannel.NEXT,))
+
+    # Then
+    assert policy.version == "v1.2.3-beta.1+build.7"
+
+
+@pytest.mark.parametrize(
     "metadata",
     (
         lambda: EnvelopeMetadata(
