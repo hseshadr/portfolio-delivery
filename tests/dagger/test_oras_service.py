@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import tomllib
 from collections.abc import Awaitable, Callable
@@ -23,7 +25,15 @@ from portfolio_delivery_dagger.inventory import (
     FileRecord,
     PrequalificationEvidenceDocument,
 )
-from portfolio_delivery_dagger.oras import ATTEMPT_ENV, ORAS_IMAGE, DaggerOrasRunner
+from portfolio_delivery_dagger.oras import (
+    ATTEMPT_ENV,
+    ORAS_IMAGE,
+    DaggerOrasRunner,
+    EncodedChunk,
+    ProviderBindings,
+    ProviderExecutionPlan,
+    ProviderObservation,
+)
 from pydantic import BaseModel, ConfigDict
 
 from portfolio_delivery.adapters.oras import MalformedProviderResponse
@@ -63,11 +73,16 @@ PYTHON_IMAGE: Final = (
     "python:3.13.14-slim@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe9cc1a0c0125e6"
 )
 PLAN_FIXTURE: Final = ROOT / "tests/dagger/plan_fixture"
+PLAN_FIXTURE_HASHES: Final = PLAN_FIXTURE / "generated.sha256"
 MIB: Final = 1_048_576
 FIVE_CHUNKS: Final = 5
 MINIMUM_MANIFEST_READS: Final = 4
 PRIVATE_CAPTURE_PREFIX: Final = "/tmp/portfolio-delivery-run/"  # noqa: S108
+EXACT_OUTPUT_DESCRIPTORS: Final = 253
+OVERFLOW_OUTPUT_DESCRIPTORS: Final = 254
+EXPECTED_FINALIZED_PUSH_ARGUMENTS: Final = 276
 type Scanner = Callable[[Directory], Awaitable[FileManifest]]
+type ChunkMutation = Callable[[tuple[EncodedChunk, ...]], tuple[EncodedChunk, ...]]
 
 
 class ProviderMetricsDocument(BaseModel):  # type: ignore[explicit-any]
@@ -143,6 +158,63 @@ def test_should_pin_plan_fixture_python_runtime() -> None:
     # Then
     assert config["project"]["requires-python"] == ">=3.13,<3.14"
     assert config["tool"]["dagger"]["base-image"] == PYTHON_IMAGE
+
+
+def test_should_regenerate_identical_plan_fixture_sdk_from_clean_checkout(tmp_path: Path) -> None:
+    # Given
+    assert PLAN_FIXTURE_HASHES.is_file()
+    expected = _expected_fixture_hashes()
+    clean_root = tmp_path / "checkout"
+    _copy_tracked_checkout(clean_root)
+
+    # When
+    _regenerate_plan_fixture(clean_root, check_lock=False)
+    first = _generated_fixture_hashes(clean_root)
+    _regenerate_plan_fixture(clean_root, check_lock=True)
+
+    # Then
+    assert first == expected
+    assert _generated_fixture_hashes(clean_root) == expected
+
+
+def _copy_tracked_checkout(destination: Path) -> None:
+    git = _required_executable("git")
+    tar = _required_executable("tar")
+    archive = subprocess.run([git, "archive", "HEAD"], cwd=ROOT, check=True, capture_output=True)
+    destination.mkdir(parents=True)
+    subprocess.run([tar, "-x", "-C", str(destination)], input=archive.stdout, check=True)
+    subprocess.run([git, "init", "-q"], cwd=destination, check=True)
+
+
+def _regenerate_plan_fixture(clean_root: Path, *, check_lock: bool) -> None:
+    fixture = clean_root / "tests/dagger/plan_fixture"
+    subprocess.run([dagger_cli(), "develop"], cwd=fixture, check=True, capture_output=True)
+    uv = _required_executable("uv")
+    lock_argv = [uv, "lock", "--check"] if check_lock else [uv, "lock"]
+    subprocess.run(lock_argv, cwd=fixture, check=True, capture_output=True)
+
+
+def _generated_fixture_hashes(clean_root: Path) -> tuple[tuple[str, str], ...]:
+    fixture = clean_root / "tests/dagger/plan_fixture"
+    generated = (*tuple((fixture / "sdk").rglob("*")), fixture / "uv.lock")
+    files = sorted(item for item in generated if item.is_file())
+    return tuple((str(item.relative_to(fixture)), _file_sha256(item)) for item in files)
+
+
+def _expected_fixture_hashes() -> tuple[tuple[str, str], ...]:
+    records = (line.split("  ", 1) for line in PLAN_FIXTURE_HASHES.read_text().splitlines())
+    return tuple((path, digest) for digest, path in records)
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _required_executable(name: str) -> str:
+    executable = shutil.which(name)
+    if executable is None:
+        raise RuntimeError(f"{name} executable is required")
+    return executable
 
 
 @pytest.mark.parametrize(
@@ -342,6 +414,34 @@ async def test_should_reject_persist_when_restore_would_reject(sizes: tuple[int,
     assert runner.invocations == []
 
 
+async def test_should_allow_exact_descriptor_limit_to_reach_persist_push() -> None:
+    # Given
+    bundle = _artifact_only_bundle(EXACT_OUTPUT_DESCRIPTORS)
+    dto, scanner = _exact_dagger_bundle(bundle)
+    runner = ObservationBoundaryRunner()
+
+    # When / Then
+    with pytest.raises(ProviderPushReachedError):
+        await oras_runtime.persist_qualified_bundle(
+            dto, scanner, lambda _: runner, "registry.example/repo", "attempt-exact-limit"
+        )
+    assert len(runner.observations[-1].argv) == EXPECTED_FINALIZED_PUSH_ARGUMENTS
+
+
+async def test_should_reject_descriptor_overflow_before_persist_provider() -> None:
+    # Given
+    bundle = _artifact_only_bundle(OVERFLOW_OUTPUT_DESCRIPTORS)
+    dto, scanner = _exact_dagger_bundle(bundle)
+    runner = ObservationBoundaryRunner()
+
+    # When / Then
+    with pytest.raises(InvalidIdentity, match="descriptor count"):
+        await oras_runtime.persist_qualified_bundle(
+            dto, scanner, lambda _: runner, "registry.example/repo", "attempt-overflow"
+        )
+    assert runner.observations == []
+
+
 def test_should_encode_restored_file_as_validated_one_mib_chunks() -> None:
     # Given
     content = b"x" * (5 * MIB)
@@ -353,6 +453,84 @@ def test_should_encode_restored_file_as_validated_one_mib_chunks() -> None:
     # Then
     assert tuple(item.ordinal for item in chunks) == tuple(range(FIVE_CHUNKS))
     assert all(item.count == FIVE_CHUNKS and item.decoded_length == MIB for item in chunks)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        pytest.param("dropped-recounted", id="dropped-recounted"),
+        pytest.param("short-nonfinal", id="short-nonfinal"),
+        pytest.param("recounted", id="recounted"),
+        pytest.param("duplicate", id="duplicate"),
+        pytest.param("reordered", id="reordered"),
+        pytest.param("malformed", id="malformed"),
+        pytest.param("empty-final", id="empty-final"),
+    ),
+)
+def test_should_reject_incomplete_or_malformed_restored_chunks(mutation: str) -> None:
+    # Given
+    content = b"a" * MIB + b"b" * MIB + b"tail"
+    digest = Sha256Digest.from_bytes(content).value
+    chunks = oras_runtime._encoded_chunks(content, digest)
+
+    # When / Then
+    with pytest.raises(InvalidIdentity):
+        oras_runtime._validate_encoded_chunks(CHUNK_MUTATIONS[mutation](chunks), content, digest)
+
+
+def _drop_and_recount_chunks(chunks: tuple[EncodedChunk, ...]) -> tuple[EncodedChunk, ...]:
+    return tuple(replace(item, count=2) for item in chunks[:2])
+
+
+def _shorten_nonfinal_chunk(chunks: tuple[EncodedChunk, ...]) -> tuple[EncodedChunk, ...]:
+    encoded = base64.b64encode(b"a" * (MIB - 1)).decode("ascii")
+    return (replace(chunks[0], decoded_length=MIB - 1, encoded=encoded), *chunks[1:])
+
+
+def _recount_chunks(chunks: tuple[EncodedChunk, ...]) -> tuple[EncodedChunk, ...]:
+    return tuple(replace(item, count=2) for item in chunks)
+
+
+def _duplicate_chunk(chunks: tuple[EncodedChunk, ...]) -> tuple[EncodedChunk, ...]:
+    duplicate = replace(chunks[0], ordinal=1)
+    return (chunks[0], duplicate, chunks[2])
+
+
+def _reorder_chunks(chunks: tuple[EncodedChunk, ...]) -> tuple[EncodedChunk, ...]:
+    return (chunks[1], chunks[0], chunks[2])
+
+
+def _malform_chunk(chunks: tuple[EncodedChunk, ...]) -> tuple[EncodedChunk, ...]:
+    return (replace(chunks[0], encoded="%%%"), *chunks[1:])
+
+
+def _empty_final_chunk(chunks: tuple[EncodedChunk, ...]) -> tuple[EncodedChunk, ...]:
+    return (*chunks[:-1], replace(chunks[-1], decoded_length=0, encoded=""))
+
+
+CHUNK_MUTATIONS: Final[dict[str, ChunkMutation]] = {
+    "dropped-recounted": _drop_and_recount_chunks,
+    "short-nonfinal": _shorten_nonfinal_chunk,
+    "recounted": _recount_chunks,
+    "duplicate": _duplicate_chunk,
+    "reordered": _reorder_chunks,
+    "malformed": _malform_chunk,
+    "empty-final": _empty_final_chunk,
+}
+
+
+def _artifact_only_bundle(count: int) -> EnvelopeBundle:
+    base = make_bundle().artifacts[0]
+    artifacts = tuple(
+        replace(
+            base,
+            name=f"package-{index}",
+            path=ArtifactPath(f"artifacts/package-{index}.whl"),
+            size=1,
+        )
+        for index in range(count)
+    )
+    return make_bundle_from(artifacts, ())
 
 
 def _sized_bundle(sizes: tuple[int, ...]) -> EnvelopeBundle:
@@ -484,6 +662,34 @@ class RecordingRunner:
     async def run(self, invocation: OrasInvocation, attempt_id: str) -> OrasResult:
         self.invocations.append(invocation)
         raise AssertionError(f"provider called for {attempt_id}")
+
+
+class ProviderPushReachedError(RuntimeError):
+    """Mark an exact-limit push that passed every pre-provider bound."""
+
+
+class ObservationBoundaryRunner:
+    def __init__(self) -> None:
+        self.observations: list[ProviderObservation] = []
+
+    async def run(self, invocation: OrasInvocation, attempt_id: str) -> OrasResult:
+        plan = oras_runtime._execution_plan(
+            invocation,
+            attempt_id,
+            len(self.observations) + 1,
+            30,
+            ProviderBindings(registry_config=True, registry_service=True),
+        )
+        self.observations.append(_provider_observation(attempt_id, plan))
+        if invocation.argv[1] == "push":
+            raise ProviderPushReachedError
+        return OrasResult(1, OrasOutcome.NOT_FOUND, b"", b"manifest unavailable")
+
+
+def _provider_observation(attempt_id: str, plan: ProviderExecutionPlan) -> ProviderObservation:
+    return ProviderObservation(
+        attempt_id, plan.argv, plan.environment, plan.capture, plan.cache_mounts
+    )
 
 
 def test_should_construct_runner_with_real_registry_service_contract() -> None:

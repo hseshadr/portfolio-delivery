@@ -109,7 +109,16 @@ MAX_RESTORE_DESCRIPTORS: Final = 256
 MAX_RESTORE_FILE_BYTES: Final = 67_108_864
 MAX_RESTORE_TOTAL_BYTES: Final = 536_870_912
 OUTPUT_CHUNK_BYTES: Final = 1_048_576
-MAX_OBSERVATION_ARGUMENTS: Final = 128
+ORAS_PUSH_PREFIX_ARGUMENTS: Final = 12
+REGISTRY_CONFIG_OPTION_ARGUMENTS: Final = 2
+REGISTRY_SERVICE_OPTION_ARGUMENTS: Final = 1
+DEADLINE_WRAPPER_ARGUMENTS: Final = 5
+MAX_OBSERVATION_ARGUMENTS: Final = MAX_RESTORE_DESCRIPTORS + (
+    ORAS_PUSH_PREFIX_ARGUMENTS
+    + REGISTRY_CONFIG_OPTION_ARGUMENTS
+    + REGISTRY_SERVICE_OPTION_ARGUMENTS
+    + DEADLINE_WRAPPER_ARGUMENTS
+)
 MAX_OBSERVATION_TEXT_BYTES: Final = 4_096
 CHUNK_READ_SCRIPT: Final = 'dd if="$1" bs="$2" skip="$3" count=1 2>/dev/null | base64'
 DEADLINE_SCRIPT: Final = (
@@ -996,8 +1005,9 @@ def _encoded_chunk(content: bytes, ordinal: int, count: int) -> EncodedChunk:
 
 def _validate_encoded_chunks(chunks: tuple[EncodedChunk, ...], content: bytes, digest: str) -> None:
     _validate_chunk_sequence(chunks)
-    _validate_chunk_contents(chunks, content)
-    _require_restored_digest(content, digest)
+    decoded = tuple(_decoded_chunk(item) for item in chunks)
+    _validate_chunk_sizes(decoded)
+    _validate_decoded_stream(decoded, content, digest)
 
 
 def _validate_chunk_sequence(chunks: tuple[EncodedChunk, ...]) -> None:
@@ -1008,11 +1018,22 @@ def _validate_chunk_sequence(chunks: tuple[EncodedChunk, ...]) -> None:
         raise InvalidIdentity("restored transfer chunk count was inconsistent")
 
 
-def _validate_chunk_contents(chunks: tuple[EncodedChunk, ...], content: bytes) -> None:
-    for item in chunks:
-        start = item.ordinal * OUTPUT_CHUNK_BYTES
-        if _decoded_chunk(item) != content[start : start + item.decoded_length]:
-            raise InvalidIdentity("restored transfer chunks changed provider bytes")
+def _validate_chunk_sizes(decoded: tuple[bytes, ...]) -> None:
+    if not decoded:
+        return
+    if any(len(item) != OUTPUT_CHUNK_BYTES for item in decoded[:-1]):
+        raise InvalidIdentity("restored transfer nonfinal chunk length was invalid")
+    if not 0 < len(decoded[-1]) <= OUTPUT_CHUNK_BYTES:
+        raise InvalidIdentity("restored transfer final chunk length was invalid")
+
+
+def _validate_decoded_stream(decoded: tuple[bytes, ...], content: bytes, digest: str) -> None:
+    reconstructed = b"".join(decoded)
+    if len(reconstructed) != len(content):
+        raise InvalidIdentity("restored transfer chunk lengths did not cover provider bytes")
+    if reconstructed != content:
+        raise InvalidIdentity("restored transfer chunks changed provider bytes")
+    _require_restored_digest(reconstructed, digest)
 
 
 def _decoded_chunk(chunk: EncodedChunk) -> bytes:
