@@ -24,7 +24,15 @@ INTROSPECTION_QUERY: Final = (
 )
 RETAINED_PROVENANCE_QUERY: Final = (
     '{ qualified: __type(name: "PortfolioDeliveryQualifiedEnvelope") { fields { name } } '
-    'envelope: __type(name: "PortfolioDeliveryBuildEnvelope") { fields { name } } }'
+    'envelope: __type(name: "PortfolioDeliveryBuildEnvelope") { fields { name } } '
+    'signed: __type(name: "PortfolioDeliverySignedBuild") { fields { name } } '
+    'prequalified: __type(name: "PortfolioDeliveryPrequalifiedBuild") { fields { name } } '
+    'unsigned: __type(name: "PortfolioDeliveryUnsignedBuild") { fields { name } } '
+    'snapshot: __type(name: "PortfolioDeliverySnapshottedSource") { fields { name } } }'
+)
+PROVIDER_OBSERVATION_QUERY: Final = (
+    '{ stored: __type(name: "PortfolioDeliveryStoredEnvelope") { fields { name } } '
+    'restored: __type(name: "PortfolioDeliveryQualifiedEnvelopeRef") { fields { name } } }'
 )
 DAGGER_CLI: Final = shutil.which("dagger")
 PHASE_ONE_FUNCTIONS: Final = frozenset(
@@ -378,17 +386,50 @@ def test_should_accept_optional_service_when_restore_is_introspected() -> None:
     assert service == {"kind": "SCALAR", "name": "ID"}
 
 
+def test_should_require_attempt_id_when_restore_is_introspected() -> None:
+    # When
+    result = run_dagger_functions_json()
+
+    # Then
+    attempt = argument_type(result, "restoreQualified", "attemptId")
+    assert attempt == {"kind": "NON_NULL", "name": None}
+
+
+def test_should_expose_bounded_provider_observations_for_live_conformance() -> None:
+    # When
+    result = cast(dict[str, object], run_dagger_query(PROVIDER_OBSERVATION_QUERY))
+
+    # Then
+    expected = {
+        "providerExecutionCount",
+        "providerInspectionCount",
+        "providerPushCount",
+        "attemptIds",
+    }
+    assert expected <= _field_names(cast(dict[str, object], result["stored"]))
+    assert expected <= _field_names(cast(dict[str, object], result["restored"]))
+
+
 def test_should_retain_exact_oras_provenance_when_qualified_is_introspected() -> None:
     # When
     result = cast(dict[str, object], run_dagger_query(RETAINED_PROVENANCE_QUERY))
     qualified = cast(dict[str, object], result["qualified"])
     envelope = cast(dict[str, object], result["envelope"])
+    retained = (
+        qualified,
+        envelope,
+        *(
+            cast(dict[str, object], result[name])
+            for name in ("signed", "prequalified", "unsigned", "snapshot")
+        ),
+    )
 
     # Then
     qualified_names = _field_names(qualified)
     envelope_names = _field_names(envelope)
     assert {"inputSnapshotSha256", "signingDisposition", "signaturePath"} <= qualified_names
     assert "signingDisposition" in envelope_names
+    assert all("inputSnapshotManifest" in _field_names(item) for item in retained)
 
 
 def _field_names(type_result: dict[str, object]) -> set[str]:

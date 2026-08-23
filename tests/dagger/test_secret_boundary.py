@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Final
 
+import portfolio_delivery_dagger.oras as oras_runtime
 import pytest
 from portfolio_delivery_dagger.oras import (
     ATTEMPT_ENV,
@@ -16,6 +17,7 @@ from portfolio_delivery_dagger.oras import (
     _authenticated_argv,
 )
 
+from portfolio_delivery.domain.stages import OrasInvocation
 from tests.dagger.test_module_api import (
     LIVE_FIXTURE,
     ROOT,
@@ -56,6 +58,22 @@ def test_should_use_regular_attempt_environment_name() -> None:
     assert ATTEMPT_ENV == "PORTFOLIO_DELIVERY_ATTEMPT_ID"
 
 
+def test_should_keep_actual_secret_bytes_out_of_recorded_provider_surfaces() -> None:
+    # Given
+    canary = CANARY_PREFIX + secrets.token_hex(12)
+    base = ("oras", "manifest", "fetch", "registry:5000/repo:tag")
+    argv = oras_runtime._authenticated_argv(base, has_registry_config=True)
+
+    # When
+    plan = oras_runtime._execution_plan(OrasInvocation(argv), "attempt-secret-recorder", 1, 30)
+
+    # Then
+    assert canary.encode() not in repr(plan).encode()
+    assert plan.environment == ((ATTEMPT_ENV, "attempt-secret-recorder"),)
+    assert plan.cache_mounts == ()
+    assert REGISTRY_CONFIG_PATH in plan.argv
+
+
 def test_should_hide_typed_registry_secret_from_every_observable_surface(
     tmp_path: Path, live_fixture: Path
 ) -> None:
@@ -69,7 +87,7 @@ def test_should_hide_typed_registry_secret_from_every_observable_surface(
 
     # Then
     assert result.returncode == 0, result.stderr
-    _assert_canary_absent(canary, result, outputs)
+    _assert_canary_absent(canary, result, files, outputs)
 
 
 def _secret_live_result(
@@ -80,9 +98,13 @@ def _secret_live_result(
 
 
 def _assert_canary_absent(
-    canary: str, result: subprocess.CompletedProcess[str], outputs: RestoredOutputs
+    canary: str,
+    result: subprocess.CompletedProcess[str],
+    files: PipelineFiles,
+    outputs: RestoredOutputs,
 ) -> None:
-    observed = result.stdout.encode() + result.stderr.encode() + _output_bytes(outputs)
+    observed = result.stdout.encode() + result.stderr.encode()
+    observed += _pipeline_input_bytes(files) + _output_bytes(outputs)
     assert canary.encode() not in observed
     source_probe = subprocess.run(
         [_rg_cli(), "-F", canary, ".dagger/src", "tests"],
@@ -101,7 +123,18 @@ def _rg_cli() -> str:
 
 
 def _output_bytes(outputs: RestoredOutputs) -> bytes:
-    paths = (outputs.envelope, outputs.qualification, outputs.artifacts, outputs.sboms)
+    return _path_bytes(outputs.envelope.parent)
+
+
+def _pipeline_input_bytes(files: PipelineFiles) -> bytes:
+    paths = (
+        files.source,
+        files.inventory,
+        files.build_input,
+        files.evidence,
+        files.artifacts,
+        files.sboms,
+    )
     return b"".join(_path_bytes(path) for path in paths)
 
 

@@ -27,7 +27,7 @@ from portfolio_delivery.domain.identity import (
     SourceRevision,
 )
 from portfolio_delivery.domain.stages import BuildEnvelope as CoreBuildEnvelope
-from portfolio_delivery.domain.stages import EnvelopeBundle, SigningDisposition
+from portfolio_delivery.domain.stages import EnvelopeBundle, SigningDisposition, validate_attempt_id
 from portfolio_delivery.domain.stages import PrequalifiedBuild as CorePrequalifiedBuild
 from portfolio_delivery.domain.stages import ReleaseSource as CoreReleaseSource
 from portfolio_delivery.domain.stages import SignedBuild as CoreSignedBuild
@@ -84,9 +84,8 @@ from portfolio_delivery_dagger.oras import (
     QualifiedEnvelopeRef,
     StoredEnvelope,
     parse_reference,
-    qualified_bundle,
+    persist_qualified_bundle,
     restored_dto,
-    stored_dto,
     validate_release_id,
 )
 from portfolio_delivery_dagger.plan import InputSnapshotPlan
@@ -279,17 +278,20 @@ class PortfolioDelivery:
         registry_service: Service | None = None,
     ) -> StoredEnvelope:
         """Reconcile one exact qualified envelope through pinned ORAS."""
-        core = await qualified_bundle(bundle, _scan_directory)
-        runner = _oras_runner(bundle, core, repository, registry_config, registry_service)
-        stored = await OrasAdapter(runner, repository).persist(core, attempt_id)
-        return stored_dto(stored)
+        factory = lambda core: _oras_runner(  # noqa: E731
+            bundle, core, repository, registry_config, registry_service
+        )
+        return await persist_qualified_bundle(
+            bundle, _scan_directory, factory, repository, attempt_id
+        )
 
     @function(cache="never")  # type: ignore[call-overload,untyped-decorator]
-    async def restore_qualified(
+    async def restore_qualified(  # noqa: PLR0913,PLR0917
         self,
         release_id: str,
         envelope_uri: str,
         envelope_digest: str,
+        attempt_id: str,
         registry_config: Secret | None = None,
         registry_service: Service | None = None,
     ) -> QualifiedEnvelopeRef:
@@ -301,7 +303,8 @@ class PortfolioDelivery:
             registry_config=registry_config,
             registry_service=registry_service,
         )
-        bundle = await OrasAdapter(runner, reference.repository).restore(reference, release_id)
+        validate_attempt_id(attempt_id)
+        bundle = await OrasAdapter(runner, reference.repository).restore(reference, attempt_id)
         validate_release_id(bundle, release_id)
         return restored_dto(runner, release_id, envelope_uri, envelope_digest, bundle)
 
@@ -519,9 +522,11 @@ def _require_release_inventory(release: ReleaseSource, digest: str) -> None:
 def _snapshot_dto(
     release: ReleaseSource, source: Directory, snapshot: SnapshotManifest
 ) -> SnapshottedSource:
+    manifest = dag.file("input-snapshot.v1.json", snapshot.content)
     return SnapshottedSource(
         source=source,
-        manifest=dag.file("input-snapshot.v1.json", snapshot.content),
+        manifest=manifest,
+        input_snapshot_manifest=manifest,
         input_snapshot_sha256=snapshot.sha256,
         project=release.project,
         version=release.version,
@@ -541,6 +546,7 @@ async def _unsigned_dto(source: SnapshottedSource, output: BuildOutput) -> Unsig
     return UnsignedBuild(
         source=source.source,
         build_input=output.build_input(),
+        input_snapshot_manifest=source.input_snapshot_manifest,
         input_snapshot_sha256=source.input_snapshot_sha256,
         artifacts=output.artifacts(),
         sboms=output.sboms(),
@@ -583,6 +589,7 @@ def _prequalified_dto(build: UnsignedBuild, evidence: File, digest: str) -> Preq
     return PrequalifiedBuild(
         source=build.source,
         build_input=build.build_input,
+        input_snapshot_manifest=build.input_snapshot_manifest,
         input_snapshot_sha256=build.input_snapshot_sha256,
         artifacts=build.artifacts,
         sboms=build.sboms,
@@ -602,6 +609,7 @@ async def _signed_dto(build: PrequalifiedBuild, signed: SigningOutput) -> Signed
     return SignedBuild(
         source=build.source,
         build_input=build.build_input,
+        input_snapshot_manifest=build.input_snapshot_manifest,
         input_snapshot_sha256=build.input_snapshot_sha256,
         artifacts=signed.artifacts(),
         sboms=signed.sboms(),
@@ -639,13 +647,20 @@ def _validate_build_identity(document: BuildEnvelopeDocument, build: SignedBuild
 async def _validate_build_bytes(document: BuildEnvelopeDocument, build: SignedBuild) -> None:
     source, artifacts, sboms = await _build_manifests(build)
     content = canonical_json_bytes(source).decode().removesuffix("\n").encode()
-    if Sha256Digest.from_bytes(content).value != build.input_snapshot_sha256:
-        raise InvalidIdentity("build source bytes must match the typed input snapshot")
+    await _require_snapshot_manifest(build, content)
     _validate_artifact_records(document.artifacts, artifacts.files)
     _validate_sbom_records(document.sboms, sboms.files)
     _validate_publish_paths(artifacts.files, sboms.files)
     _validate_evidence_subjects(document.prequalification_evidence, build.source_tree_sha256)
     await _validate_retained_evidence(document.prequalification_evidence, build)
+
+
+async def _require_snapshot_manifest(build: SignedBuild, observed: bytes) -> None:
+    retained = await _bounded_bytes(build.input_snapshot_manifest, MAX_MANIFEST_BYTES)
+    if retained != observed:
+        raise InvalidIdentity("retained snapshot manifest must match the exact source manifest")
+    if Sha256Digest.from_bytes(retained).value != build.input_snapshot_sha256:
+        raise InvalidIdentity("snapshot manifest bytes must match their retained digest")
 
 
 async def _validate_retained_evidence(
@@ -832,6 +847,7 @@ def _envelope_dto(build: SignedBuild, envelope: CoreBuildEnvelope) -> BuildEnvel
         sboms=build.sboms,
         source=build.source,
         build_input=build.build_input,
+        input_snapshot_manifest=build.input_snapshot_manifest,
         input_snapshot_sha256=build.input_snapshot_sha256,
         prequalification_evidence=build.prequalification_evidence,
         prequalification_evidence_sha256=build.prequalification_evidence_sha256,
@@ -864,6 +880,7 @@ def _envelope_build(envelope: BuildEnvelope) -> SignedBuild:
     return SignedBuild(
         source=envelope.source,
         build_input=envelope.build_input,
+        input_snapshot_manifest=envelope.input_snapshot_manifest,
         input_snapshot_sha256=envelope.input_snapshot_sha256,
         artifacts=envelope.artifacts,
         sboms=envelope.sboms,
@@ -908,6 +925,7 @@ def _qualified_dto(envelope: BuildEnvelope, qualification: File, digest: str) ->
         sboms=envelope.sboms,
         prequalification_evidence=envelope.prequalification_evidence,
         prequalification_evidence_sha256=envelope.prequalification_evidence_sha256,
+        input_snapshot_manifest=envelope.input_snapshot_manifest,
         input_snapshot_sha256=envelope.input_snapshot_sha256,
         signing_disposition=envelope.signing_disposition,
         signature_path=envelope.signature_path,

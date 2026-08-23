@@ -50,6 +50,7 @@ class SnapshottedSource:
 
     source: Directory = field()
     manifest: File = field()
+    input_snapshot_manifest: File = field()
     input_snapshot_sha256: str = field()
     project: str = field()
     version: str = field()
@@ -66,6 +67,7 @@ class UnsignedBuild:
 
     source: Directory = field()
     build_input: File = field()
+    input_snapshot_manifest: File = field()
     input_snapshot_sha256: str = field()
     artifacts: Directory = field()
     sboms: Directory = field()
@@ -84,6 +86,7 @@ class PrequalifiedBuild:
 
     source: Directory = field()
     build_input: File = field()
+    input_snapshot_manifest: File = field()
     input_snapshot_sha256: str = field()
     artifacts: Directory = field()
     sboms: Directory = field()
@@ -104,6 +107,7 @@ class SignedBuild:
 
     source: Directory = field()
     build_input: File = field()
+    input_snapshot_manifest: File = field()
     input_snapshot_sha256: str = field()
     artifacts: Directory = field()
     sboms: Directory = field()
@@ -129,6 +133,7 @@ class BuildEnvelope:
     sboms: Directory = field()
     source: Directory = field()
     build_input: File = field()
+    input_snapshot_manifest: File = field()
     input_snapshot_sha256: str = field()
     prequalification_evidence: File = field()
     prequalification_evidence_sha256: str = field()
@@ -155,6 +160,7 @@ class QualifiedEnvelope:
     sboms: Directory = field()
     prequalification_evidence: File = field()
     prequalification_evidence_sha256: str = field()
+    input_snapshot_manifest: File = field()
     input_snapshot_sha256: str = field()
     signing_disposition: str = field()
     signature_path: str | None = field()

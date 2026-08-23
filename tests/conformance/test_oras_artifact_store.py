@@ -51,6 +51,7 @@ def _files() -> tuple[FakeFile, ...]:
 def _inject_simple_fault(runner: FakeOrasRunner, bundle: EnvelopeBundle, fault: Fault) -> None:
     runner.timeout_before_write = fault == "timeout-before"
     runner.timeout_after_write = fault == "timeout-after"
+    runner.overwrite_after_push = fault == "inverted"
     if fault in {"malformed", "oversized"}:
         content = b"{" if fault == "malformed" else b"x" * (MAX_MANIFEST_BYTES + 1)
         runner.put_manifest(f"{REPOSITORY}:{content_reference(bundle).tag}", content)

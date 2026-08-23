@@ -24,6 +24,7 @@ type Fault = Literal[
     "malformed",
     "oversized",
     "unavailable",
+    "inverted",
 ]
 
 
@@ -114,6 +115,10 @@ async def assert_timeout_before_write_leaves_no_state(factory: ArtifactStoreFact
     with pytest.raises(ProviderTimeout):
         await harness.store.persist(harness.bundle, "attempt-before-timeout")
     assert harness.probe.write_count == 0
+    observed = await harness.store.inspect(
+        harness.reference_for(harness.bundle), "attempt-after-before-timeout"
+    )
+    assert observed is None
 
 
 async def assert_timeout_after_write_reconciles(factory: ArtifactStoreFactory) -> None:
@@ -129,6 +134,7 @@ async def assert_timeout_after_write_reconciles(factory: ArtifactStoreFactory) -
     observed = (stored.reference.repository, stored.reference.tag)
     assert observed == (expected.repository, expected.tag)
     assert harness.probe.write_count == 1
+    assert harness.probe.observation_count > 0
 
 
 @pytest.mark.parametrize("fault", ("malformed", "oversized", "unavailable"))
@@ -138,24 +144,41 @@ async def assert_invalid_observations_fail_closed(
     # Given
     harness = await factory.create()
     await harness.inject(fault)
+    writes = harness.probe.write_count
 
     # When / Then
     with pytest.raises((MalformedProviderResponse, ProviderUnavailable)):
-        await harness.store.inspect(harness.reference_for(harness.bundle), f"attempt-{fault}")
+        await harness.store.persist(harness.bundle, f"attempt-{fault}")
+    assert harness.probe.write_count == writes
+    await _assert_fault_state_did_not_take_over(harness, f"attempt-restore-{fault}")
 
 
 async def assert_inverted_observations_preserve_identity(factory: ArtifactStoreFactory) -> None:
     # Given
     harness = await factory.create()
-    second = await harness.store.persist(harness.alternate, "attempt-later-first")
+    await harness.inject("inverted")
+    writes = harness.probe.write_count
 
-    # When
-    first = await harness.store.persist(harness.bundle, "attempt-earlier-second")
-    restored = await harness.store.restore(first.reference, "attempt-restore-first")
+    # When / Then
+    with pytest.raises((ArtifactConflict, ValueError, MalformedProviderResponse)):
+        await harness.store.persist(harness.bundle, "attempt-inverted-observation")
+    assert harness.probe.write_count <= writes + 1
+    await _assert_inverted_state_did_not_take_over(harness)
 
-    # Then
-    assert first.reference != second.reference
-    assert restored == harness.bundle
+
+async def _assert_inverted_state_did_not_take_over(harness: ArtifactStoreHarness) -> None:
+    await _assert_fault_state_did_not_take_over(harness, "attempt-inverted-restore")
+
+
+async def _assert_fault_state_did_not_take_over(
+    harness: ArtifactStoreHarness, attempt_id: str
+) -> None:
+    reference = harness.reference_for(harness.bundle)
+    try:
+        restored = await harness.store.restore(reference, attempt_id)
+    except (ArtifactConflict, KeyError, MalformedProviderResponse, ProviderUnavailable, ValueError):
+        return
+    assert restored != harness.bundle
 
 
 async def assert_restore_is_exact(factory: ArtifactStoreFactory) -> None:

@@ -43,10 +43,25 @@ class ControlledMemoryStore:
     async def persist(self, bundle: EnvelopeBundle, attempt_id: str) -> StoredEnvelope:
         if self._controls.fault == "timeout-before":
             raise ProviderTimeout("memory transport timed out")
+        reference = _reference(bundle, self._store.repository)
+        observed = await self.inspect(reference, attempt_id)
+        if observed is not None:
+            return await self._reuse(bundle, reference, observed, attempt_id)
         result = await self._store.persist(bundle, attempt_id)
         if self._controls.fault == "timeout-after":
             return await self._store.inspect(result.reference, attempt_id) or result
         return result
+
+    async def _reuse(
+        self,
+        bundle: EnvelopeBundle,
+        reference: OciReference,
+        observed: StoredEnvelope,
+        attempt_id: str,
+    ) -> StoredEnvelope:
+        if await self._store.restore(reference, attempt_id) != bundle:
+            raise ValueError("conflicting bytes for an immutable content tag")
+        return observed
 
     async def restore(self, reference: OciReference, attempt_id: str) -> EnvelopeBundle:
         return await self._store.restore(reference, attempt_id)
@@ -73,7 +88,8 @@ def _injector(
 ) -> Callable[[Fault], Awaitable[None]]:
     async def inject(fault: Fault) -> None:
         controls.fault = fault
-        if fault == "conflict":
+        poisoned = {"conflict", "inverted", "malformed", "oversized", "unavailable"}
+        if fault in poisoned:
             store.bundles[_key(_reference(bundle, store.repository))] = make_signed_bundle()
 
     return inject

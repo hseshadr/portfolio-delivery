@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import base64
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from pathlib import PurePosixPath
-from typing import Final
+from typing import Final, Literal, cast
 
 from dagger import (
     Client,
@@ -20,6 +21,7 @@ from dagger import (
     field,
     object_type,
 )
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from portfolio_delivery.adapters.oras import (
     MAX_BLOB_BYTES,
@@ -27,7 +29,9 @@ from portfolio_delivery.adapters.oras import (
     MAX_PROCESS_STDOUT_BYTES,
     MAX_STDERR_BYTES,
     MalformedProviderResponse,
+    OrasAdapter,
 )
+from portfolio_delivery.contracts.storage import OrasRunner
 from portfolio_delivery.domain.artifacts import (
     Artifact,
     Evidence,
@@ -82,7 +86,7 @@ from portfolio_delivery.envelope.documents import (
     ToolchainDocument,
 )
 from portfolio_delivery_dagger.dto import QualifiedEnvelope as DaggerQualifiedEnvelope
-from portfolio_delivery_dagger.inventory import FileManifest
+from portfolio_delivery_dagger.inventory import FileManifest, PrequalificationEvidenceDocument
 
 ORAS_IMAGE: Final = (
     "ghcr.io/oras-project/oras@sha256:"
@@ -91,19 +95,79 @@ ORAS_IMAGE: Final = (
 REGISTRY_CONFIG_PATH: Final = "/run/secrets/registry-config.json"
 ATTEMPT_ENV: Final = "PORTFOLIO_DELIVERY_ATTEMPT_ID"
 WORKDIR: Final = "/work"
-STDOUT_PATH: Final = "/work/.portfolio-delivery.stdout"
-PROCESS_STDOUT_PATH: Final = "/work/.portfolio-delivery.process-stdout"
-STDERR_PATH: Final = "/work/.portfolio-delivery.stderr"
-MANIFEST_PATH: Final = "/work/manifest.json"
+CAPTURE_ROOT: Final = "/tmp/portfolio-delivery-run"  # noqa: S108
 CORE_INPUT_PATHS: Final = (
     "config.v1.json",
     "build-envelope.v1.json",
     "qualification-record.v1.json",
 )
-NOT_FOUND_MARKERS: Final = (b"manifest unknown", b"manifest_unknown")
-REGISTRY_ERROR_PREFIX: Final = b"error response from registry:"
 TIMEOUT_EXIT_CODE: Final = 124
+DEFAULT_EXECUTION_DEADLINE_SECONDS: Final = 120
+MAX_RESTORE_DESCRIPTORS: Final = 256
+MAX_RESTORE_FILE_BYTES: Final = 4_194_304
+MAX_RESTORE_TOTAL_BYTES: Final = 67_108_864
+OUTPUT_CHUNK_BYTES: Final = 1_048_576
+CHUNK_READ_SCRIPT: Final = 'dd if="$1" bs="$2" skip="$3" count=1 2>/dev/null | base64'
+DEADLINE_SCRIPT: Final = (
+    'deadline="$1"; shift; timeout -s TERM -k 5 "$deadline" "$@"; status=$?; '
+    'case "$status" in 137|143) exit 124;; *) exit "$status";; esac'
+)
+NOT_FOUND_RESPONSES: Final = (
+    re.compile(rb"error response from registry: manifest unknown\r?\n?", re.IGNORECASE),
+    re.compile(rb"error response from registry: manifest_unknown\r?\n?", re.IGNORECASE),
+    re.compile(
+        rb'error response from registry: failed to fetch the content of "([^"\r\n]+)": '
+        rb"\1: not found\r?\n?",
+        re.IGNORECASE,
+    ),
+)
 type DirectoryScanner = Callable[[Directory], Awaitable[FileManifest]]
+type RunnerFactory = Callable[[EnvelopeBundle], OrasRunner]
+
+
+class _RestoreDescriptor(BaseModel):  # type: ignore[explicit-any]
+    model_config = ConfigDict(frozen=True, extra="allow")
+    size: int = Field(ge=0, strict=True)
+
+
+class _RestoreManifest(BaseModel):  # type: ignore[explicit-any]
+    model_config = ConfigDict(frozen=True, extra="allow")
+    schema_version: Literal[2] = Field(alias="schemaVersion")
+    config: _RestoreDescriptor
+    layers: tuple[_RestoreDescriptor, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CapturePaths:
+    directory: str
+    stdout: str
+    process_stdout: str
+    stderr: str
+    manifest: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderExecutionPlan:
+    argv: tuple[str, ...]
+    environment: tuple[tuple[str, str], ...]
+    capture: CapturePaths
+    cache_mounts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderObservation:
+    attempt_id: str
+    argv: tuple[str, ...]
+    environment: tuple[tuple[str, str], ...]
+    capture: CapturePaths
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedRecordBytes:
+    envelope: bytes
+    qualification: bytes
+    snapshot_manifest: bytes
+    prequalification_evidence: bytes
 
 
 @dataclass(kw_only=True)
@@ -113,6 +177,10 @@ class StoredEnvelope:
 
     envelope_uri: str = field()
     envelope_digest: str = field()
+    provider_execution_count: int = field()
+    provider_inspection_count: int = field()
+    provider_push_count: int = field()
+    attempt_ids: list[str] = field()
 
 
 @dataclass(kw_only=True)
@@ -127,6 +195,10 @@ class QualifiedEnvelopeRef:
     qualification: File = field()
     artifacts: Directory = field()
     sboms: Directory = field()
+    provider_execution_count: int = field()
+    provider_inspection_count: int = field()
+    provider_push_count: int = field()
+    attempt_ids: list[str] = field()
 
 
 @dataclass(slots=True)
@@ -141,30 +213,34 @@ class DaggerOrasRunner:
     sbom_paths: tuple[str, ...] = ()
     registry_config: Secret | None = None
     registry_service: Service | None = None
+    execution_deadline_seconds: int = DEFAULT_EXECUTION_DEADLINE_SECONDS
     execution_count: int = 0
     inspection_count: int = 0
     push_count: int = 0
     service_started: bool = False
     fetched_blobs: dict[str, bytes] = dataclass_field(default_factory=dict)
     previous_container: Container | None = None
+    observations: list[ProviderObservation] = dataclass_field(default_factory=list)
 
     async def run(self, invocation: OrasInvocation, attempt_id: str) -> OrasResult:
         validate_attempt_id(attempt_id)
         await self._start_service()
-        self._record(invocation)
-        executed = self._execute(invocation, attempt_id)
+        plan = _execution_plan(
+            invocation, attempt_id, self.execution_count + 1, self.execution_deadline_seconds
+        )
+        self._record(invocation, plan)
+        executed = self._execute(invocation, plan)
         self.previous_container = executed
-        exit_code = await executed.exit_code()
-        output_path = _provider_output_path(invocation)
-        stdout = await _read_output(executed, output_path, _stdout_limit(invocation))
-        stderr = await _read_output(executed, STDERR_PATH, MAX_STDERR_BYTES)
-        exported = await _exported_manifest(executed, invocation)
-        self._retain_blob(invocation, stdout, exit_code)
-        outcome = _outcome(invocation, exit_code, stderr)
-        return OrasResult(exit_code, outcome, stdout, stderr, exported)
+        result = await _execution_result(executed, invocation, plan)
+        _validate_successful_manifest(invocation, result)
+        self._retain_blob(invocation, result.stdout, result.exit_code)
+        return result
 
-    def _record(self, invocation: OrasInvocation) -> None:
+    def _record(self, invocation: OrasInvocation, plan: ProviderExecutionPlan) -> None:
         self.execution_count += 1
+        self.observations.append(
+            ProviderObservation(plan.environment[0][1], plan.argv, plan.environment, plan.capture)
+        )
         if _is_push(invocation.argv):
             self.push_count += 1
         else:
@@ -176,23 +252,29 @@ class DaggerOrasRunner:
         await self.registry_service.start()
         self.service_started = True
 
-    def _execute(self, invocation: OrasInvocation, attempt_id: str) -> Container:
-        container = self._configured_container(invocation)
+    def _execute(self, invocation: OrasInvocation, plan: ProviderExecutionPlan) -> Container:
+        container = self._configured_container(invocation, plan)
         argv = _execution_argv(
             invocation.argv, self.registry_config is not None, self.registry_service is not None
         )
-        return container.with_env_variable(ATTEMPT_ENV, attempt_id).with_exec(
-            list(argv),
-            redirect_stdout=PROCESS_STDOUT_PATH,
-            redirect_stderr=STDERR_PATH,
+        private_argv = _private_output_argv(argv, plan.capture)
+        deadline_argv = _deadline_argv(private_argv, self.execution_deadline_seconds)
+        return container.with_env_variable(*plan.environment[0]).with_exec(
+            list(deadline_argv),
+            redirect_stdout=plan.capture.process_stdout,
+            redirect_stderr=plan.capture.stderr,
             expect=ReturnType.ANY,
         )
 
-    def _configured_container(self, invocation: OrasInvocation) -> Container:
+    def _configured_container(
+        self, invocation: OrasInvocation, plan: ProviderExecutionPlan
+    ) -> Container:
         if self.previous_container is not None:
-            return self._mount_invocation(self.previous_container, invocation)
+            container = self._mount_invocation(self.previous_container, invocation)
+            return container.with_directory(plan.capture.directory, self.client.directory())
         container = self._base_container()
-        return self._mount_invocation(container, invocation)
+        container = self._mount_invocation(container, invocation)
+        return container.with_directory(plan.capture.directory, self.client.directory())
 
     def _base_container(self) -> Container:
         container = self.client.container().from_(ORAS_IMAGE)
@@ -269,16 +351,50 @@ def _execution_argv(
     argv: tuple[str, ...], has_registry_config: bool, has_registry_service: bool
 ) -> tuple[str, ...]:
     authenticated = _authenticated_argv(argv, has_registry_config)
-    authenticated = _output_argv(authenticated)
     if not has_registry_service:
         return authenticated
     return _insert_provider_options(authenticated, ("--plain-http",))
 
 
-def _output_argv(argv: tuple[str, ...]) -> tuple[str, ...]:
-    if argv[1:3] not in {("manifest", "fetch"), ("blob", "fetch")}:
-        return argv
-    return _insert_provider_options(argv, ("--output", STDOUT_PATH))
+def _execution_plan(
+    invocation: OrasInvocation, attempt_id: str, ordinal: int, deadline_seconds: int
+) -> ProviderExecutionPlan:
+    validate_attempt_id(attempt_id)
+    capture = _capture_paths(ordinal)
+    argv = _private_output_argv(invocation.argv, capture)
+    return ProviderExecutionPlan(
+        _deadline_argv(argv, deadline_seconds), ((ATTEMPT_ENV, attempt_id),), capture
+    )
+
+
+def _capture_paths(ordinal: int) -> CapturePaths:
+    directory = f"{CAPTURE_ROOT}/{ordinal}"
+    return CapturePaths(
+        directory,
+        f"{directory}/stdout",
+        f"{directory}/process-stdout",
+        f"{directory}/stderr",
+        f"{directory}/manifest.json",
+    )
+
+
+def _private_output_argv(argv: tuple[str, ...], capture: CapturePaths) -> tuple[str, ...]:
+    if argv[1:3] in {("manifest", "fetch"), ("blob", "fetch")}:
+        return _insert_provider_options(argv, ("--output", capture.stdout))
+    if _is_push(argv):
+        return _replace_option(argv, "--export-manifest", capture.manifest)
+    return argv
+
+
+def _replace_option(argv: tuple[str, ...], option: str, value: str) -> tuple[str, ...]:
+    index = argv.index(option) + 1
+    return (*argv[:index], value, *argv[index + 1 :])
+
+
+def _deadline_argv(argv: tuple[str, ...], seconds: int) -> tuple[str, ...]:
+    if isinstance(seconds, bool) or not isinstance(seconds, int) or seconds < 1:
+        raise InvalidIdentity("provider execution deadline must be a positive integer")
+    return ("/bin/sh", "-c", DEADLINE_SCRIPT, "deadline-wrapper", str(seconds), *argv)
 
 
 def _authenticated_argv(argv: tuple[str, ...], has_registry_config: bool) -> tuple[str, ...]:
@@ -307,33 +423,88 @@ def _stdout_limit(invocation: OrasInvocation) -> int:
     if command == ("manifest", "fetch"):
         return MAX_MANIFEST_BYTES
     if command == ("blob", "fetch"):
-        return MAX_BLOB_BYTES
+        return min(MAX_BLOB_BYTES, MAX_RESTORE_FILE_BYTES)
     return MAX_PROCESS_STDOUT_BYTES
 
 
-def _provider_output_path(invocation: OrasInvocation) -> str:
+def _provider_output_path(invocation: OrasInvocation, capture: CapturePaths) -> str:
     if invocation.argv[1:3] in {("manifest", "fetch"), ("blob", "fetch")}:
-        return STDOUT_PATH
-    return PROCESS_STDOUT_PATH
+        return capture.stdout
+    return capture.process_stdout
+
+
+async def _execution_result(
+    container: Container, invocation: OrasInvocation, plan: ProviderExecutionPlan
+) -> OrasResult:
+    exit_code = await container.exit_code()
+    stdout = await _read_provider_stdout(container, invocation, plan)
+    stderr = await _read_output(container, plan.capture.stderr, MAX_STDERR_BYTES)
+    exported = await _exported_manifest(container, invocation, plan, exit_code)
+    return _provider_result(invocation, exit_code, stdout, stderr, exported)
+
+
+async def _read_provider_stdout(
+    container: Container, invocation: OrasInvocation, plan: ProviderExecutionPlan
+) -> bytes:
+    path = _provider_output_path(invocation, plan.capture)
+    return await _read_output(container, path, _stdout_limit(invocation))
 
 
 async def _read_output(container: Container, path: str, limit: int) -> bytes:
     if not await container.exists(path):
         return b""
-    file = container.file(path)
-    if await file.size() > limit:
+    size = await container.file(path).size()
+    if size > limit:
         raise MalformedProviderResponse("ORAS provider output exceeded its response bound")
-    encoded = await container.with_exec(["base64", path]).stdout()
+    chunks = [
+        await _read_output_chunk(container, path, item) for item in _output_chunk_ordinals(size)
+    ]
+    content = b"".join(chunks)
+    if len(content) != size:
+        raise MalformedProviderResponse("ORAS provider output changed during bounded capture")
+    return content
+
+
+async def _read_output_chunk(container: Container, path: str, ordinal: int) -> bytes:
+    argv = [
+        "/bin/sh",
+        "-c",
+        CHUNK_READ_SCRIPT,
+        "bounded-output-reader",
+        path,
+        str(OUTPUT_CHUNK_BYTES),
+        str(ordinal),
+    ]
+    encoded = await container.with_exec(argv).stdout()
     try:
         return base64.b64decode(encoded)
     except ValueError as error:
         raise MalformedProviderResponse("ORAS provider output encoding was malformed") from error
 
 
-async def _exported_manifest(container: Container, invocation: OrasInvocation) -> bytes | None:
-    if not _is_push(invocation.argv) or not await container.exists(MANIFEST_PATH):
+def _output_chunk_ordinals(size: int) -> tuple[int, ...]:
+    count = (size + OUTPUT_CHUNK_BYTES - 1) // OUTPUT_CHUNK_BYTES
+    return tuple(range(count))
+
+
+async def _exported_manifest(
+    container: Container, invocation: OrasInvocation, plan: ProviderExecutionPlan, code: int
+) -> bytes | None:
+    path = plan.capture.manifest
+    if code != 0 or not _is_push(invocation.argv) or not await container.exists(path):
         return None
-    return await _read_output(container, MANIFEST_PATH, MAX_MANIFEST_BYTES)
+    return await _read_output(container, path, MAX_MANIFEST_BYTES)
+
+
+def _provider_result(
+    invocation: OrasInvocation,
+    code: int,
+    stdout: bytes,
+    stderr: bytes,
+    exported: bytes | None,
+) -> OrasResult:
+    authoritative = exported if code == 0 and _is_push(invocation.argv) else None
+    return OrasResult(code, _outcome(invocation, code, stderr), stdout, stderr, authoritative)
 
 
 def _outcome(invocation: OrasInvocation, code: int, stderr: bytes) -> OrasOutcome:
@@ -347,32 +518,82 @@ def _outcome(invocation: OrasInvocation, code: int, stderr: bytes) -> OrasOutcom
 
 
 def _is_not_found(stderr: bytes) -> bool:
-    lowered = stderr.lower()
-    registry_not_found = lowered.startswith(REGISTRY_ERROR_PREFIX) and lowered.rstrip().endswith(
-        b": not found"
-    )
-    return registry_not_found or any(marker in lowered for marker in NOT_FOUND_MARKERS)
+    return any(pattern.fullmatch(stderr) is not None for pattern in NOT_FOUND_RESPONSES)
+
+
+def _validate_successful_manifest(invocation: OrasInvocation, result: OrasResult) -> None:
+    if invocation.argv[1:3] == ("manifest", "fetch") and result.outcome is OrasOutcome.SUCCESS:
+        _validate_restore_manifest(result.stdout)
+
+
+def _validate_restore_manifest(content: bytes) -> None:
+    try:
+        payload = parse_bounded_json(content, MAX_MANIFEST_BYTES)
+        manifest = _RestoreManifest.model_validate(payload)
+    except (ValidationError, ValueError) as error:
+        raise MalformedProviderResponse("ORAS returned a malformed OCI manifest") from error
+    _require_restore_descriptor_bounds((manifest.config, *manifest.layers))
+
+
+def _require_restore_descriptor_bounds(descriptors: tuple[_RestoreDescriptor, ...]) -> None:
+    sizes = tuple(item.size for item in descriptors)
+    _require_descriptor_count(sizes)
+    _require_file_sizes(sizes)
+    _require_total_size(sizes)
+
+
+def _require_descriptor_count(sizes: tuple[int, ...]) -> None:
+    if len(sizes) > MAX_RESTORE_DESCRIPTORS:
+        raise MalformedProviderResponse("OCI manifest exceeds its descriptor count bound")
+
+
+def _require_file_sizes(sizes: tuple[int, ...]) -> None:
+    if any(size > MAX_RESTORE_FILE_BYTES for size in sizes):
+        raise MalformedProviderResponse("OCI descriptor exceeds its per-file byte bound")
+
+
+def _require_total_size(sizes: tuple[int, ...]) -> None:
+    if sum(sizes) > MAX_RESTORE_TOTAL_BYTES:
+        raise MalformedProviderResponse("OCI manifest exceeds its aggregate restored-byte bound")
 
 
 async def qualified_bundle(
     bundle: DaggerQualifiedEnvelope, scanner: DirectoryScanner
 ) -> EnvelopeBundle:
-    envelope_bytes, qualification_bytes = await _validated_record_bytes(bundle)
-    payload = parse_bounded_json(envelope_bytes, MAX_MANIFEST_BYTES)
+    records = await _validated_record_bytes(bundle)
+    payload = parse_bounded_json(records.envelope, MAX_MANIFEST_BYTES)
     document = BuildEnvelopeDocument.model_validate(payload)
     qualification = QualificationRecordDocument.model_validate(
-        parse_bounded_json(qualification_bytes, MAX_MANIFEST_BYTES)
+        parse_bounded_json(records.qualification, MAX_MANIFEST_BYTES)
     )
+    _validate_retained_provenance(records, document)
     await _validate_output_directories(bundle, document, scanner)
-    return _reconstruct_bundle(bundle, document, qualification, envelope_bytes, qualification_bytes)
+    return _reconstruct_bundle(
+        bundle, document, qualification, records.envelope, records.qualification
+    )
 
 
-async def _validated_record_bytes(bundle: DaggerQualifiedEnvelope) -> tuple[bytes, bytes]:
+async def _validated_record_bytes(bundle: DaggerQualifiedEnvelope) -> RetainedRecordBytes:
     envelope = await _bounded_file_bytes(bundle.envelope, MAX_MANIFEST_BYTES)
     qualification = await _bounded_file_bytes(bundle.qualification, MAX_MANIFEST_BYTES)
+    snapshot = await _bounded_file_bytes(bundle.input_snapshot_manifest, MAX_MANIFEST_BYTES)
+    evidence = await _bounded_file_bytes(bundle.prequalification_evidence, MAX_MANIFEST_BYTES)
     _require_digest(envelope, bundle.envelope_sha256, "envelope")
     _require_digest(qualification, bundle.qualification_sha256, "qualification")
-    return envelope, qualification
+    _require_digest(snapshot, bundle.input_snapshot_sha256, "input snapshot manifest")
+    _require_digest(evidence, bundle.prequalification_evidence_sha256, "prequalification evidence")
+    return RetainedRecordBytes(envelope, qualification, snapshot, evidence)
+
+
+def _validate_retained_provenance(
+    records: RetainedRecordBytes,
+    document: BuildEnvelopeDocument,
+) -> None:
+    evidence = PrequalificationEvidenceDocument.model_validate(
+        parse_bounded_json(records.prequalification_evidence, MAX_MANIFEST_BYTES)
+    )
+    if evidence.evidence != document.prequalification_evidence:
+        raise InvalidIdentity("retained evidence must match canonical envelope declarations")
 
 
 async def _bounded_file_bytes(file: File, limit: int) -> bytes:
@@ -550,11 +771,28 @@ def _evidence(document: EvidenceDocument) -> Evidence:
     )
 
 
-def stored_dto(stored: CoreStoredEnvelope) -> StoredEnvelope:
+async def persist_qualified_bundle(
+    bundle: DaggerQualifiedEnvelope,
+    scanner: DirectoryScanner,
+    runner_factory: RunnerFactory,
+    repository: str,
+    attempt_id: str,
+) -> StoredEnvelope:
+    core = await qualified_bundle(bundle, scanner)
+    runner = runner_factory(core)
+    stored = await OrasAdapter(runner, repository).persist(core, attempt_id)
+    return stored_dto(stored, cast(DaggerOrasRunner, runner))
+
+
+def stored_dto(stored: CoreStoredEnvelope, runner: DaggerOrasRunner) -> StoredEnvelope:
     reference = stored.reference
     return StoredEnvelope(
         envelope_uri=f"{reference.repository}:{reference.tag}",
         envelope_digest=stored.manifest_sha256.value,
+        provider_execution_count=runner.execution_count,
+        provider_inspection_count=runner.inspection_count,
+        provider_push_count=runner.push_count,
+        attempt_ids=_attempt_ids(runner),
     )
 
 
@@ -585,7 +823,15 @@ def _restored_ref(
         ),
         artifacts=_record_directory(client, runner, bundle, artifacts=True),
         sboms=_record_directory(client, runner, bundle, artifacts=False),
+        provider_execution_count=runner.execution_count,
+        provider_inspection_count=runner.inspection_count,
+        provider_push_count=runner.push_count,
+        attempt_ids=_attempt_ids(runner),
     )
+
+
+def _attempt_ids(runner: DaggerOrasRunner) -> list[str]:
+    return [item.attempt_id for item in runner.observations]
 
 
 def _record_directory(
