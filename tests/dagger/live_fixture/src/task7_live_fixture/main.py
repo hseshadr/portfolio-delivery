@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from dataclasses import dataclass
 
@@ -35,6 +36,7 @@ class PublicMetrics:
 @dataclass(frozen=True, slots=True)
 class PublicSmoke:
     envelope_uri: str
+    envelope_bytes_sha256: str
     first_digest: str
     second_digest: str
     first: PublicMetrics
@@ -208,10 +210,12 @@ async def _public_effects(
         first, secret, service, f"restore-attempt-two-{run_id}"
     )
     exact = await _exact_public_bytes(qualified, restored, repeated)
+    envelope_sha256 = await _file_sha256(qualified.envelope())
     stdout, stderr = await _registry_logs(service)
     return await _public_document(
         (first, second),
         (restored, repeated),
+        envelope_sha256,
         exact,
         (qualified_id, first_id, second_id, restored_id, repeated_id),
         stdout,
@@ -254,6 +258,7 @@ async def _public_document(
         dagger.PortfolioDeliveryQualifiedEnvelopeRef,
         dagger.PortfolioDeliveryQualifiedEnvelopeRef,
     ],
+    envelope_sha256: str,
     exact: bool,
     object_ids: tuple[str, ...],
     stdout: str,
@@ -265,7 +270,15 @@ async def _public_document(
         first.envelope_uri(), first.envelope_digest(), second.envelope_digest()
     )
     return PublicSmoke(
-        uri, first_digest, second_digest, *metrics, exact, object_ids, stdout, stderr
+        uri,
+        envelope_sha256,
+        first_digest,
+        second_digest,
+        *metrics,
+        exact,
+        object_ids,
+        stdout,
+        stderr,
     )
 
 
@@ -296,7 +309,7 @@ def _exact_pairs(
     restored: dagger.PortfolioDeliveryQualifiedEnvelopeRef,
     repeated: dagger.PortfolioDeliveryQualifiedEnvelopeRef,
 ) -> tuple[tuple[dagger.File, dagger.File], ...]:
-    artifact = "artifacts/package.whl"
+    artifact = "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl"
     sbom = "sbom/package.cdx.json"
     originals = (
         original.envelope(),
@@ -325,6 +338,11 @@ async def _same_file(left: dagger.File, right: dagger.File) -> bool:
         .with_exec(["cmp", "-s", "/left", "/right"], expect=dagger.ReturnType.ANY)
     )
     return await checked.exit_code() == 0
+
+
+async def _file_sha256(source: dagger.File) -> str:
+    content = (await source.contents()).encode()
+    return "sha256:" + hashlib.sha256(content).hexdigest()
 
 
 def _registry_service() -> dagger.Service:

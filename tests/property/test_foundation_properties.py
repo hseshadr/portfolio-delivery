@@ -94,7 +94,7 @@ def _source() -> SnapshottedSource:
 def _signed_build(content: bytes) -> SignedBuild:
     artifact = Artifact(
         "package",
-        ArtifactPath("artifacts/package.whl"),
+        ArtifactPath("artifacts/portfolio_delivery-0.1.0-py3-none-any.whl"),
         "application/zip",
         len(content),
         Sha256Digest.from_bytes(content),

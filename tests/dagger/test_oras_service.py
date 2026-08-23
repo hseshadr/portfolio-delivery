@@ -132,6 +132,7 @@ class LiveMetricsDocument(ProviderLifecycleDocument):  # type: ignore[explicit-a
 class PublicSmokeDocument(ProviderLifecycleDocument):  # type: ignore[explicit-any]
     model_config = ConfigDict(frozen=True, extra="forbid")
     envelope_uri: str
+    envelope_bytes_sha256: str
     first_digest: str
     second_digest: str
     exact_bytes: bool
@@ -731,6 +732,7 @@ def test_should_execute_public_root_oci_lifecycle_with_one_service(
     assert result.returncode == 0, result.stderr
     document = PublicSmokeDocument.model_validate_json(result.stdout)
     assert document.exact_bytes
+    assert document.envelope_uri.endswith(document.envelope_bytes_sha256.replace(":", "-"))
     assert document.first_digest == document.second_digest
     assert all(document.object_ids)
     _assert_provider_metrics(document)
@@ -891,7 +893,8 @@ def _assert_live_result(stdout: str, outputs: RestoredOutputs) -> None:
     assert outputs.repeated_qualification.read_bytes() == outputs.qualification.read_bytes()
     assert _directory_bytes(outputs.repeated_artifacts) == _directory_bytes(outputs.artifacts)
     assert _directory_bytes(outputs.repeated_sboms) == _directory_bytes(outputs.sboms)
-    assert (outputs.artifacts / "artifacts/package.whl").read_bytes() == b"wheel"
+    wheel = outputs.artifacts / "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl"
+    assert wheel.read_bytes() == b"wheel"
     assert (outputs.sboms / "sbom/package.cdx.json").read_bytes() == b'{"bomFormat":"CycloneDX"}\n'
     _assert_provider_metrics(metrics)
     _assert_attempt_ids(metrics)

@@ -23,6 +23,9 @@ FIXTURE: Final = ROOT / "tests/fixtures/envelope/input"
 LIVE_FIXTURE: Final = ROOT / "tests/dagger/live_fixture"
 MAX_DIAGNOSTIC_CHARACTERS: Final[int] = 4_096
 DEMO_TIMEOUT_SECONDS: Final[int] = 600
+EXPECTED_OPERATION_ATTEMPTS: Final[int] = 4
+WHEEL_NAME: Final = "portfolio_delivery-0.1.0-py3-none-any.whl"
+WHEEL_PATH: Final = f"artifacts/{WHEEL_NAME}"
 
 
 class DemoError(RuntimeError):
@@ -36,7 +39,7 @@ class ProviderMetrics(BaseModel):  # type: ignore[explicit-any]
     execution_count: int = Field(ge=0)
     inspection_count: int = Field(ge=0)
     push_count: int = Field(ge=0)
-    attempt_ids: tuple[str, ...] = Field(max_length=32)
+    attempt_ids: tuple[str, ...] = Field(min_length=1, max_length=32)
 
 
 class PublicSmoke(BaseModel):  # type: ignore[explicit-any]
@@ -44,6 +47,7 @@ class PublicSmoke(BaseModel):  # type: ignore[explicit-any]
 
     model_config = ConfigDict(frozen=True, extra="forbid")
     envelope_uri: str = Field(max_length=2_048)
+    envelope_bytes_sha256: str
     first_digest: str
     second_digest: str
     first: ProviderMetrics
@@ -55,7 +59,7 @@ class PublicSmoke(BaseModel):  # type: ignore[explicit-any]
     registry_stdout: str = Field(max_length=131_072)
     registry_stderr: str = Field(max_length=131_072)
 
-    @field_validator("first_digest", "second_digest")
+    @field_validator("envelope_bytes_sha256", "first_digest", "second_digest")
     @classmethod
     def validate_digest(cls, value: str) -> str:
         return Sha256Digest(value).value
@@ -120,7 +124,7 @@ def _copy_outputs(root: Path) -> tuple[Path, Path]:
     sboms = root / "sboms/sbom"
     artifacts.mkdir(parents=True)
     sboms.mkdir(parents=True)
-    shutil.copy2(FIXTURE / "artifacts/package.whl", artifacts / "package.whl")
+    shutil.copy2(FIXTURE / WHEEL_PATH, artifacts / WHEEL_NAME)
     shutil.copy2(FIXTURE / "sbom/package.cdx.json", sboms / "package.cdx.json")
     return artifacts.parent, sboms.parent
 
@@ -141,7 +145,7 @@ def _build_input(root: Path, source_digest: str) -> tuple[Path, Path]:
 
 def _package_artifact(document: dict[str, object]) -> list[dict[str, object]]:
     artifacts = cast(list[dict[str, object]], document["artifacts"])
-    return [item for item in artifacts if item["path"] == "artifacts/package.whl"]
+    return [item for item in artifacts if item["path"] == WHEEL_PATH]
 
 
 def _prepare_inputs(root: Path) -> DemoInputs:
@@ -194,14 +198,67 @@ def _envelope_digest(uri: str) -> str:
     return Sha256Digest("sha256:" + uri.rsplit(marker, 1)[1]).value
 
 
+def _single_attempt(metrics: ProviderMetrics, prefix: str) -> str:
+    attempts = frozenset(metrics.attempt_ids)
+    if len(attempts) != 1:
+        raise DemoError("public smoke returned ambiguous attempt evidence")
+    attempt = next(iter(attempts))
+    if not attempt or not attempt.startswith(prefix):
+        raise DemoError("public smoke returned mismatched attempt evidence")
+    return attempt
+
+
+def _validate_persist_metrics(smoke: PublicSmoke) -> int:
+    metrics = (smoke.first, smoke.second)
+    complete = all(
+        item.execution_count == item.inspection_count + item.push_count for item in metrics
+    )
+    if not complete or not all(item.inspection_count > 0 for item in metrics):
+        raise DemoError("public smoke returned incomplete persistence evidence")
+    if smoke.first.push_count != 1 or smoke.second.push_count != 0:
+        raise DemoError("public smoke did not prove one provider write")
+    return sum(item.push_count for item in metrics)
+
+
+def _validate_restore_metrics(smoke: PublicSmoke) -> None:
+    metrics = (smoke.restore_one, smoke.restore_two)
+    exact = all(item.execution_count == item.inspection_count for item in metrics)
+    if not exact or not all(item.inspection_count > 0 for item in metrics):
+        raise DemoError("public smoke returned incomplete restoration evidence")
+    if any(item.push_count != 0 for item in metrics):
+        raise DemoError("public smoke mutated the provider during restoration")
+
+
+def _validated_attempt_count(smoke: PublicSmoke) -> int:
+    persist = (
+        _single_attempt(smoke.first, "attempt-one-"),
+        _single_attempt(smoke.second, "attempt-two-"),
+    )
+    restore = (
+        _single_attempt(smoke.restore_one, "restore-attempt-one-"),
+        _single_attempt(smoke.restore_two, "restore-attempt-two-"),
+    )
+    if len(frozenset((*persist, *restore))) != EXPECTED_OPERATION_ATTEMPTS:
+        raise DemoError("public smoke reused provider attempt identities")
+    return len(frozenset(persist))
+
+
+def _validated_envelope_digest(smoke: PublicSmoke) -> str:
+    digest = _envelope_digest(smoke.envelope_uri)
+    if digest != smoke.envelope_bytes_sha256:
+        raise DemoError("public smoke returned a non-authoritative envelope digest")
+    if smoke.first_digest != smoke.second_digest or not smoke.exact_bytes:
+        raise DemoError("public smoke did not prove authoritative exact persistence")
+    return digest
+
+
 def _proof(smoke: PublicSmoke) -> DemoProof:
-    writes = smoke.first.push_count + smoke.second.push_count
-    if smoke.first_digest != smoke.second_digest or writes != 1 or not smoke.exact_bytes:
-        raise DemoError("public smoke did not prove idempotent exact persistence")
+    writes = _validate_persist_metrics(smoke)
+    _validate_restore_metrics(smoke)
     return DemoProof(
-        envelope_sha256=_envelope_digest(smoke.envelope_uri),
+        envelope_sha256=_validated_envelope_digest(smoke),
         manifest_sha256=smoke.first_digest,
-        attempts=2,
+        attempts=_validated_attempt_count(smoke),
         provider_writes=writes,
         exact_restore=smoke.exact_bytes,
     )

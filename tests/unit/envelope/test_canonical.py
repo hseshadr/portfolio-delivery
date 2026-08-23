@@ -125,7 +125,7 @@ def test_should_reject_duplicate_artifact_path_when_document_is_parsed() -> None
     artifacts.append(
         {
             "name": "package-copy",
-            "path": "artifacts/package.whl",
+            "path": "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl",
             "mediaType": "application/vnd.python.wheel",
             "size": 35,
             "sha256": _digest("f"),

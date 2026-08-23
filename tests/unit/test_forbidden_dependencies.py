@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Final
 
@@ -95,12 +96,32 @@ def _unsafe_mutation_suppressions(path: Path) -> tuple[int, ...]:
 
 
 def _is_reviewed_suppression(path: Path, line: str) -> bool:
+    key = _suppression_key(path, line, ROOT)
+    return key in REVIEWED_EQUIVALENT_SUPPRESSIONS
+
+
+def _suppression_key(path: Path, line: str, root: Path) -> tuple[str, str] | None:
     try:
-        relative = str(path.relative_to(ROOT))
+        relative = str(path.relative_to(root))
     except ValueError:
-        return False
+        return None
     code = line.split(MUTATION_PRAGMA, maxsplit=1)[0].strip()
-    return (relative, code) in REVIEWED_EQUIVALENT_SUPPRESSIONS
+    return relative, code
+
+
+def _reviewed_suppression_counts(paths: tuple[Path, ...], root: Path) -> Counter[tuple[str, str]]:
+    counts: Counter[tuple[str, str]] = Counter()
+    for path in paths:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            key = _suppression_key(path, line, root)
+            if MUTATION_PRAGMA in line and key in REVIEWED_EQUIVALENT_SUPPRESSIONS:
+                counts[key] += 1
+    return counts
+
+
+def _has_exact_reviewed_suppressions(paths: tuple[Path, ...], root: Path) -> bool:
+    expected = Counter({key: 1 for key in REVIEWED_EQUIVALENT_SUPPRESSIONS})
+    return _reviewed_suppression_counts(paths, root) == expected
 
 
 def _permitted_diagnostic_lines(tree: ast.Module) -> frozenset[int]:
@@ -304,13 +325,38 @@ def test_should_allow_only_standalone_template_rendering_suppression(tmp_path: P
     assert _unsafe_mutation_suppressions(module) == ()
 
 
+def test_should_reject_duplicate_reviewed_suppression(tmp_path: Path) -> None:
+    # Given
+    grouped: dict[str, list[str]] = {}
+    for relative, code in REVIEWED_EQUIVALENT_SUPPRESSIONS:
+        grouped.setdefault(relative, []).append(code)
+    duplicate = 'text = content.decode("utf-8")'
+    grouped["src/portfolio_delivery/envelope/canonical.py"].append(duplicate)
+    paths = tuple(tmp_path / relative for relative in sorted(grouped))
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = (
+            f"{code}  {MUTATION_PRAGMA}\n" for code in grouped[str(path.relative_to(tmp_path))]
+        )
+        path.write_text("".join(lines), encoding="utf-8")
+
+    # When
+    exact = _has_exact_reviewed_suppressions(paths, tmp_path)
+
+    # Then
+    assert not exact
+
+
 def test_should_have_only_reviewed_mutation_suppressions() -> None:
     # Given / When
+    paths = tuple(sorted(SOURCE_ROOT.rglob("*.py")))
     violations = tuple(
         (path.relative_to(ROOT), line)
-        for path in sorted(SOURCE_ROOT.rglob("*.py"))
+        for path in paths
         for line in _unsafe_mutation_suppressions(path)
     )
+    exact = _has_exact_reviewed_suppressions(paths, ROOT)
 
     # Then
     assert violations == ()
+    assert exact

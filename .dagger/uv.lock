@@ -477,6 +477,7 @@ dev = [
     { name = "hypothesis", specifier = ">=6.140,<7" },
     { name = "mutmut", specifier = ">=3.3,<4" },
     { name = "mypy", specifier = ">=1.18,<2" },
+    { name = "packaging", specifier = "==26.3" },
     { name = "pip-audit", specifier = ">=2.9,<3" },
     { name = "poethepoet", specifier = ">=0.37,<1" },
     { name = "pytest", specifier = ">=9.0.3,<10" },

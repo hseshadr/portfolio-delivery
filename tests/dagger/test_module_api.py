@@ -210,7 +210,7 @@ def _write_pipeline_bytes(
     (artifacts / "artifacts").mkdir(parents=True)
     (sboms / "sbom").mkdir(parents=True)
     (source / "src/app.py").write_bytes(b"app")
-    (artifacts / "artifacts/package.whl").write_bytes(artifact_bytes)
+    (artifacts / "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl").write_bytes(artifact_bytes)
     (sboms / "sbom/package.cdx.json").write_bytes(b'{"bomFormat":"CycloneDX"}\n')
 
 
@@ -227,7 +227,8 @@ def _pipeline_document(tmp_path: Path, digest: str, artifacts: Path, sboms: Path
     document = json.loads((FIXTURE / "build-input.json").read_text(encoding="utf-8"))
     document["source"]["sourceTreeSha256"] = digest
     document["prequalificationEvidence"][0]["subject"] = digest
-    document["artifacts"] = [_artifact_declaration(artifacts / "artifacts/package.whl")]
+    wheel = artifacts / "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl"
+    document["artifacts"] = [_artifact_declaration(wheel)]
     document["sboms"] = [_sbom_declaration(sboms / "sbom/package.cdx.json")]
     build_input = tmp_path / "build-input.json"
     build_input.write_text(json.dumps(document), encoding="utf-8")
@@ -249,7 +250,7 @@ def _pipeline_evidence(tmp_path: Path, digest: str) -> Path:
 def _artifact_declaration(path: Path) -> dict[str, str | int]:
     return {
         "name": "package",
-        "path": "artifacts/package.whl",
+        "path": "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl",
         "mediaType": "application/octet-stream",
         "size": path.stat().st_size,
         "sha256": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -258,7 +259,7 @@ def _artifact_declaration(path: Path) -> dict[str, str | int]:
 
 def _sbom_declaration(path: Path) -> dict[str, str]:
     return {
-        "artifactPath": "artifacts/package.whl",
+        "artifactPath": "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl",
         "path": "sbom/package.cdx.json",
         "mediaType": "application/vnd.cyclonedx+json",
         "sha256": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -458,7 +459,9 @@ def test_should_change_snapshot_sha256_when_included_artifact_changes(tmp_path: 
     original = snapshot_sha256(source)
 
     # When
-    (source / "artifacts/package.whl").write_bytes(b"changed artifact bytes")
+    (source / "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl").write_bytes(
+        b"changed artifact bytes"
+    )
 
     # Then
     assert snapshot_sha256(source) != original
@@ -493,14 +496,15 @@ def test_should_publish_exact_validated_bytes_and_records(
 
 def _assert_archive(archive: tarfile.TarFile, files: PipelineFiles) -> None:
     expected = {
-        "artifacts/package.whl",
+        "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl",
         "sbom/package.cdx.json",
         "records/build-envelope.v1.json",
         "records/qualification-record.v1.json",
         "checksums.sha256",
     }
     assert set(archive.getnames()) == expected
-    assert archive_bytes(archive, "artifacts/package.whl") == b"wheel"
+    wheel = "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl"
+    assert archive_bytes(archive, wheel) == b"wheel"
     assert archive_bytes(archive, "sbom/package.cdx.json") == b'{"bomFormat":"CycloneDX"}\n'
     _assert_records(archive, files)
     _assert_checksums(archive, expected - {"checksums.sha256"})
@@ -546,13 +550,15 @@ def test_should_reject_incoherent_pipeline_bytes(
 
 def _introduce_mismatch(files: PipelineFiles, mismatch: str) -> None:
     if mismatch == "artifact":
-        (files.artifacts / "artifacts/package.whl").write_bytes(b"changed")
+        wheel = files.artifacts / "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl"
+        wheel.write_bytes(b"changed")
         return
     if mismatch == "extra":
         (files.artifacts / "artifacts/extra").write_bytes(b"extra")
         return
     if mismatch == "missing":
-        (files.artifacts / "artifacts/package.whl").unlink()
+        wheel = files.artifacts / "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl"
+        wheel.unlink()
         return
     if mismatch == "sbom":
         (files.sboms / "sbom/package.cdx.json").write_bytes(b"changed")

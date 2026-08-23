@@ -101,9 +101,10 @@ fails until the reviewed build-input and golden envelope declarations are update
 
 ```bash
 SOURCE_DATE_EPOCH=1724472000 uv build --wheel --no-sources --out-dir dist .
-cp dist/portfolio_delivery-0.1.0-py3-none-any.whl tests/fixtures/envelope/input/artifacts/package.whl
+cp dist/portfolio_delivery-0.1.0-py3-none-any.whl \
+  tests/fixtures/envelope/input/artifacts/portfolio_delivery-0.1.0-py3-none-any.whl
 uv run python scripts/build-release-sbom.py \
-  --wheel tests/fixtures/envelope/input/artifacts/package.whl \
+  --wheel tests/fixtures/envelope/input/artifacts/portfolio_delivery-0.1.0-py3-none-any.whl \
   --output tests/fixtures/envelope/input/sbom/package.cdx.json \
   --source-date-epoch 1724472000
 uv run pytest -q tests/unit/test_release_fixtures.py tests/unit/envelope/test_canonical.py
@@ -115,10 +116,12 @@ The output is one canonical JSON object with this bounded shape:
 {"attempts":2,"envelope_sha256":"sha256:<64 lowercase hex>","exact_restore":true,"manifest_sha256":"sha256:<64 lowercase hex>","provider_writes":1}
 ```
 
-`envelope_sha256` identifies the canonical build-envelope bytes.
+`envelope_sha256` identifies the canonical build-envelope bytes and is independently recomputed
+from those bytes before the URI is trusted.
 `manifest_sha256` identifies the OCI manifest produced by the provider. `attempts: 2` with
-`provider_writes: 1` is the observable idempotency proof; `exact_restore: true` covers the envelope,
-detached qualification, wheel, and SBOM bytes.
+`provider_writes: 1` is derived from two distinct validated provider attempt identities and is the
+observable idempotency proof; `exact_restore: true` covers the envelope, detached qualification,
+wheel, and SBOM bytes.
 
 ## Quality and architecture gates
 

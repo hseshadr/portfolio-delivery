@@ -17,6 +17,7 @@ from typing import cast
 
 from cyclonedx.schema import SchemaVersion
 from cyclonedx.validation.json import JsonStrictValidator
+from packaging.utils import parse_wheel_filename
 
 
 def _source_repository_root(candidate: Path) -> Path:
@@ -26,7 +27,7 @@ def _source_repository_root(candidate: Path) -> Path:
 TEST_ROOT = Path(__file__).parents[2]
 ROOT = _source_repository_root(TEST_ROOT)
 FIXTURE = ROOT / "tests/fixtures/envelope/input"
-WHEEL = FIXTURE / "artifacts/package.whl"
+WHEEL = FIXTURE / "artifacts/portfolio_delivery-0.1.0-py3-none-any.whl"
 SBOM = FIXTURE / "sbom/package.cdx.json"
 BUILD_INPUT = FIXTURE / "build-input.json"
 PROJECT_NAME = "portfolio-delivery"
@@ -69,6 +70,15 @@ def test_should_contain_real_portfolio_delivery_wheel_metadata() -> None:
     # Then
     assert (name, version) == (PROJECT_NAME, PROJECT_VERSION)
     assert "Tag: py3-none-any" in wheel_text
+
+
+def test_should_use_installer_accepted_wheel_filename() -> None:
+    # Given / When
+    name, version, build, tags = parse_wheel_filename(WHEEL.name)
+
+    # Then
+    assert (name, str(version), build) == ("portfolio-delivery", PROJECT_VERSION, ())
+    assert {str(tag) for tag in tags} == {"py3-none-any"}
 
 
 def test_should_contain_importable_portfolio_delivery_package() -> None:
@@ -152,7 +162,7 @@ def _build_input() -> dict[str, object]:
 
 def _package_declaration(document: dict[str, object]) -> dict[str, object]:
     artifacts = cast(list[dict[str, object]], document["artifacts"])
-    return next(artifact for artifact in artifacts if artifact["path"] == "artifacts/package.whl")
+    return next(artifact for artifact in artifacts if artifact["path"] == f"artifacts/{WHEEL.name}")
 
 
 def _sbom_component(document: dict[str, object]) -> dict[str, object]:
