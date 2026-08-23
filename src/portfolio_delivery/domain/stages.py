@@ -272,15 +272,61 @@ class OrasInvocation:
         _require_tuple(self.input_bytes, bytes, "ORAS inputs must be a tuple of bytes")
 
 
+class OrasOutcome(StrEnum):
+    """Typed classification of one ORAS provider execution."""
+
+    SUCCESS = "success"
+    NOT_FOUND = "not_found"
+    TIMEOUT = "timeout"
+    FAILURE = "failure"
+
+
 @dataclass(frozen=True, slots=True)
 class OrasResult:
     exit_code: int
+    outcome: OrasOutcome
     stdout: bytes
     stderr: bytes
+    exported_file_bytes: bytes | None = None
 
     def __post_init__(self) -> None:
-        if isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int):
-            raise InvalidIdentity("ORAS exit code must be an integer")
+        _validate_oras_result(self)
+
+
+def _validate_oras_result(result: OrasResult) -> None:
+    _validate_oras_exit_code(result.exit_code)
+    _validate_oras_outcome(result.outcome)
+    _validate_oras_process_output(result.stdout, result.stderr)
+    _validate_oras_result_coherence(result)
+
+
+def _validate_oras_exit_code(exit_code: object) -> None:
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        raise InvalidIdentity("ORAS exit code must be an integer")
+
+
+def _validate_oras_outcome(outcome: object) -> None:
+    if not isinstance(outcome, OrasOutcome):
+        raise InvalidIdentity("ORAS outcome must use the typed provider classification")
+
+
+def _validate_oras_process_output(stdout: object, stderr: object) -> None:
+    if not isinstance(stdout, bytes) or not isinstance(stderr, bytes):
+        raise InvalidIdentity("ORAS process output must be exact bytes")
+
+
+def _validate_oras_result_coherence(result: OrasResult) -> None:
+    success = result.outcome is OrasOutcome.SUCCESS
+    if success != (result.exit_code == 0):
+        raise InvalidIdentity("ORAS outcome must agree with its exit code")
+    _validate_oras_export(result.exported_file_bytes, success)
+
+
+def _validate_oras_export(exported: object, success: bool) -> None:
+    if exported is not None and not isinstance(exported, bytes):
+        raise InvalidIdentity("ORAS exported file payload must be exact bytes")
+    if not success and exported is not None:
+        raise InvalidIdentity("failed ORAS executions cannot export authoritative file bytes")
 
 
 def validate_attempt_id(attempt_id: str) -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Final, Literal, Self
+from typing import Annotated, Final, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -16,6 +16,7 @@ QUALIFICATION_MEDIA_TYPE: Final = (
     "application/vnd.hseshadr.portfolio-delivery.qualification.v1+json"
 )
 CONFIG_MEDIA_TYPE: Final = "application/vnd.hseshadr.portfolio-delivery.config.v1+json"
+type OciOrderIndex = Annotated[int, Field(ge=0, strict=True)]
 
 
 class BoundaryDocument(BaseModel):  # type: ignore[explicit-any]
@@ -236,13 +237,61 @@ class QualificationRecordDocument(BoundaryDocument):  # type: ignore[explicit-an
         return self
 
 
+class OciStageOrderDocument(BoundaryDocument):  # type: ignore[explicit-any]
+    unsigned_artifact_order: tuple[OciOrderIndex, ...] = Field(alias="unsignedArtifactOrder")
+    unsigned_sbom_order: tuple[OciOrderIndex, ...] = Field(alias="unsignedSbomOrder")
+    lock_order: tuple[OciOrderIndex, ...] = Field(alias="lockOrder")
+    toolchain_order: tuple[OciOrderIndex, ...] = Field(alias="toolchainOrder")
+    prequalification_evidence_order: tuple[OciOrderIndex, ...] = Field(
+        alias="prequalificationEvidenceOrder"
+    )
+    bundle_artifact_order: tuple[OciOrderIndex, ...] = Field(alias="bundleArtifactOrder")
+    bundle_sbom_order: tuple[OciOrderIndex, ...] = Field(alias="bundleSbomOrder")
+
+
 class OciConfigDocument(BoundaryDocument):  # type: ignore[explicit-any]
+    schema_version: Literal["v1"] = Field(default="v1", alias="schemaVersion")
     media_type: Literal["application/vnd.hseshadr.portfolio-delivery.config.v1+json"] = Field(
         default=CONFIG_MEDIA_TYPE, alias="mediaType"
     )
     artifact_type: Literal["application/vnd.hseshadr.portfolio-delivery.envelope.v1"] = Field(
         default="application/vnd.hseshadr.portfolio-delivery.envelope.v1", alias="artifactType"
     )
+    envelope_sha256: str = Field(alias="envelopeSha256")
+    qualification_sha256: str = Field(alias="qualificationSha256")
+    release_idempotency_key: str = Field(alias="releaseIdempotencyKey")
+    input_snapshot_sha256: str = Field(alias="inputSnapshotSha256")
+    signing_disposition: Literal["signed", "signing_not_required"] = Field(
+        alias="signingDisposition"
+    )
+    signature_path: str | None = Field(alias="signaturePath")
+    stage_order: OciStageOrderDocument = Field(alias="stageOrder")
+
+    @field_validator("envelope_sha256", "qualification_sha256", "input_snapshot_sha256")
+    @classmethod
+    def validate_digest(cls, value: str) -> str:
+        return Sha256Digest(value).value
+
+    @field_validator("release_idempotency_key")
+    @classmethod
+    def validate_idempotency_key(cls, value: str) -> str:
+        if not value or value != value.strip():
+            raise ValueError("release idempotency key must be non-empty and canonical")
+        return value
+
+    @field_validator("signature_path")
+    @classmethod
+    def validate_signature_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return normalize_artifact_path(value).value
+
+    @model_validator(mode="after")
+    def validate_signing_coherence(self) -> Self:
+        has_signature = self.signature_path is not None
+        if (self.signing_disposition == "signed") != has_signature:
+            raise ValueError("signed config provenance requires exactly one signature path")
+        return self
 
 
 def _reject_duplicates(values: tuple[str, ...]) -> None:

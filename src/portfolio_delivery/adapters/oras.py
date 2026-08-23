@@ -1,19 +1,19 @@
 """Pure ORAS command planning and immutable generic-OCI reconciliation.
 
 The injected runner owns authentication, mounted payload files, and execution. Push
-results surface the exact ``--export-manifest`` bytes through ``OrasResult.stdout``;
-manifest and blob fetches likewise return their exact bytes through stdout.
+results surface exact ``--export-manifest`` bytes separately from bounded process
+output; manifest and blob fetches return their exact bytes through stdout.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Final, Literal, NoReturn
+from typing import Final, Literal, NoReturn, cast
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from portfolio_delivery.contracts.storage import OrasRunner
 from portfolio_delivery.domain.artifacts import (
@@ -36,6 +36,7 @@ from portfolio_delivery.domain.stages import (
     EnvelopeBundle,
     OciReference,
     OrasInvocation,
+    OrasOutcome,
     OrasResult,
     PrequalifiedBuild,
     QualificationRecord,
@@ -48,7 +49,16 @@ from portfolio_delivery.domain.stages import (
     UnsignedBuild,
     validate_attempt_id,
 )
-from portfolio_delivery.envelope.canonical import canonical_json_bytes
+from portfolio_delivery.envelope.builder import (
+    EnvelopeBuilder,
+    EnvelopeMetadata,
+    PinnedCompatibility,
+    ProjectAdapterVersion,
+    QualificationBuilder,
+    ReleaseChannel,
+    ReleasePolicyMetadata,
+)
+from portfolio_delivery.envelope.canonical import canonical_json_bytes, parse_bounded_json
 from portfolio_delivery.envelope.documents import (
     BUILD_ENVELOPE_MEDIA_TYPE,
     CONFIG_MEDIA_TYPE,
@@ -58,6 +68,7 @@ from portfolio_delivery.envelope.documents import (
     EvidenceDocument,
     LockDocument,
     OciConfigDocument,
+    OciStageOrderDocument,
     QualificationRecordDocument,
     SbomDocument,
     ToolchainDocument,
@@ -73,7 +84,8 @@ MAX_REPOSITORY_LENGTH: Final[int] = 255
 MAX_TAG_LENGTH: Final[int] = 128
 MAX_PATH_LENGTH: Final[int] = 4_096
 MAX_MEDIA_TYPE_LENGTH: Final[int] = 255
-TIMEOUT_EXIT_CODE: Final[int] = 124
+MAX_BLOB_BYTES: Final[int] = 1_073_741_824
+MAX_PROCESS_STDOUT_BYTES: Final[int] = 65_536
 REQUIRED_CORE_LAYERS: Final[int] = 2
 _REPOSITORY: Final = re.compile(
     r"[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?"
@@ -127,6 +139,13 @@ class _Descriptor(_BoundaryModel):  # type: ignore[explicit-any]
     def title(self) -> str | None:
         return self.annotations.get(TITLE_ANNOTATION)
 
+    @model_validator(mode="after")
+    def validate_annotations(self) -> _Descriptor:
+        keys = set(self.annotations)
+        if keys not in (set(), {TITLE_ANNOTATION}):
+            raise ValueError("OCI descriptor annotations are not allowlisted")
+        return self
+
 
 class _Manifest(_BoundaryModel):  # type: ignore[explicit-any]
     schema_version: Literal[2] = Field(alias="schemaVersion")
@@ -156,6 +175,16 @@ class _ExpectedLayer:
 
 
 @dataclass(frozen=True, slots=True)
+class _ValidatedBundle:
+    bundle: EnvelopeBundle
+    envelope_document: BuildEnvelopeDocument
+    qualification_document: QualificationRecordDocument
+    config_document: OciConfigDocument
+    artifacts: tuple[Artifact, ...]
+    sboms: tuple[Sbom, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class OrasAdapter:
     """Plan and reconcile one immutable generic-OCI envelope repository."""
 
@@ -166,9 +195,7 @@ class OrasAdapter:
         _validate_repository(self.repository)
 
     def plan_push(self, bundle: EnvelopeBundle) -> OrasInvocation:
-        layers = _expected_layers(bundle)
-        _validate_expected_layers(layers)
-        return OrasInvocation(_push_argv(self.repository, bundle, layers), _input_bytes(bundle))
+        return _plan_push(_validate_bundle(bundle), self.repository)
 
     async def inspect(self, reference: OciReference, attempt_id: str) -> StoredEnvelope | None:
         validate_attempt_id(attempt_id)
@@ -178,12 +205,13 @@ class OrasAdapter:
 
     async def persist(self, bundle: EnvelopeBundle, attempt_id: str) -> StoredEnvelope:
         validate_attempt_id(attempt_id)
+        validated = _validate_bundle(bundle)
         reference = _content_reference(bundle, self.repository)
         existing = await self._observe_tag(reference, attempt_id)
         if existing is not None:
-            await self._require_bundle(existing, bundle, attempt_id, ArtifactConflict)
+            await self._require_bundle(existing, validated, attempt_id, ArtifactConflict)
             return _stored_required(reference, existing)
-        return await self._push_and_reconcile(bundle, reference, attempt_id)
+        return await self._push_and_reconcile(validated, reference, attempt_id)
 
     async def restore(self, reference: OciReference, attempt_id: str) -> EnvelopeBundle:
         validate_attempt_id(attempt_id)
@@ -194,24 +222,26 @@ class OrasAdapter:
         return await self._restore_observation(observation, reference.repository, attempt_id)
 
     async def _push_and_reconcile(
-        self, bundle: EnvelopeBundle, reference: OciReference, attempt_id: str
+        self, bundle: _ValidatedBundle, reference: OciReference, attempt_id: str
     ) -> StoredEnvelope:
         try:
             exported = await self._push(bundle, attempt_id)
         except ProviderTimeout as timeout:
             return await self._recover_timeout(bundle, reference, attempt_id, timeout)
-        observed = await self._observe_digest(exported, self.repository, attempt_id)
+        observed = _require_post_push_manifest(
+            exported, await self._observe_tag(reference, attempt_id)
+        )
         await self._require_bundle(observed, bundle, attempt_id, MalformedProviderResponse)
         return _stored_required(reference, observed)
 
-    async def _push(self, bundle: EnvelopeBundle, attempt_id: str) -> _Observation:
-        result = await self.runner.run(self.plan_push(bundle), attempt_id)
-        content = _successful_stdout(result, MAX_MANIFEST_BYTES)
+    async def _push(self, bundle: _ValidatedBundle, attempt_id: str) -> _Observation:
+        result = await self.runner.run(_plan_push(bundle, self.repository), attempt_id)
+        content = _successful_exported_file(result)
         return _parse_manifest(content)
 
     async def _recover_timeout(
         self,
-        bundle: EnvelopeBundle,
+        bundle: _ValidatedBundle,
         reference: OciReference,
         attempt_id: str,
         error: ProviderTimeoutError,
@@ -244,12 +274,12 @@ class OrasAdapter:
     async def _require_bundle(
         self,
         observation: _Observation,
-        bundle: EnvelopeBundle,
+        bundle: _ValidatedBundle,
         attempt_id: str,
         conflict_type: type[OrasAdapterError],
     ) -> None:
         expected = _expected_layers(bundle)
-        _require_created_annotation(observation.manifest, bundle, conflict_type)
+        _require_created_annotation(observation.manifest, bundle.bundle, conflict_type)
         _require_descriptors(observation.manifest, expected, conflict_type)
         await self._require_blobs(observation, expected, attempt_id, conflict_type)
 
@@ -266,9 +296,13 @@ class OrasAdapter:
             _require_blob(content, layer, conflict_type)
 
     async def _fetch_blob(self, descriptor: _Descriptor, repository: str, attempt_id: str) -> bytes:
+        _require_bounded_blob_size(descriptor.size)
         reference = f"{repository}@{descriptor.digest}"
         result = await self.runner.run(_blob_fetch(reference), attempt_id)
-        return _successful_stdout(result, descriptor.size)
+        content = _successful_stdout(result, descriptor.size)
+        if len(content) != descriptor.size:
+            raise MalformedProviderResponse("OCI blob size differs from its descriptor")
+        return content
 
     async def _restore_observation(
         self, observation: _Observation, repository: str, attempt_id: str
@@ -279,6 +313,152 @@ class OrasAdapter:
         )
         _require_descriptor_bytes(descriptors, contents)
         return _restore_bundle(observation.manifest, contents)
+
+
+def _plan_push(bundle: _ValidatedBundle, repository: str) -> OrasInvocation:
+    layers = _expected_layers(bundle)
+    _validate_expected_layers(layers)
+    argv = _push_argv(repository, bundle.bundle, layers)
+    return OrasInvocation(argv, _input_bytes(bundle))
+
+
+def _validate_bundle(bundle: EnvelopeBundle) -> _ValidatedBundle:
+    if not isinstance(bundle, EnvelopeBundle):
+        raise ValueError("bundle must use the immutable envelope bundle contract")
+    envelope_document = _validate_bundle_envelope(bundle)
+    qualification_document = _validate_bundle_qualification(bundle)
+    artifacts = _validate_bundle_artifacts(bundle, envelope_document)
+    sboms = _validate_bundle_sboms(bundle, envelope_document)
+    config = _config_document(bundle, envelope_document)
+    return _ValidatedBundle(
+        bundle, envelope_document, qualification_document, config, artifacts, sboms
+    )
+
+
+def _validate_bundle_envelope(bundle: EnvelopeBundle) -> BuildEnvelopeDocument:
+    envelope = bundle.qualified.envelope
+    document = _local_envelope_document(envelope.canonical_bytes)
+    if envelope.document != document:
+        raise ValueError("bundle envelope document must match its exact canonical bytes")
+    rebuilt = EnvelopeBuilder(_metadata(document)).build(envelope.signed)
+    if rebuilt != envelope:
+        raise ValueError("bundle envelope stage graph must match its canonical document")
+    return document
+
+
+def _validate_bundle_qualification(bundle: EnvelopeBundle) -> QualificationRecordDocument:
+    envelope = bundle.qualified.envelope
+    record = bundle.qualified.qualification
+    document = _local_qualification_document(record.canonical_bytes)
+    if record.document != document:
+        raise ValueError("bundle qualification document must match its exact canonical bytes")
+    checks = tuple(_evidence(item) for item in document.qualification_evidence)
+    if QualificationBuilder().build(envelope, checks) != record:
+        raise ValueError("bundle qualification must bind every final-envelope subject")
+    return document
+
+
+def _validate_bundle_artifacts(
+    bundle: EnvelopeBundle, document: BuildEnvelopeDocument
+) -> tuple[Artifact, ...]:
+    artifacts = _artifacts(document)
+    if not _same_records(bundle.artifacts, artifacts, Artifact, _artifact_key):
+        raise ValueError("bundle artifacts must exactly match the canonical envelope")
+    return artifacts
+
+
+def _validate_bundle_sboms(
+    bundle: EnvelopeBundle, document: BuildEnvelopeDocument
+) -> tuple[Sbom, ...]:
+    sboms = _sboms(document)
+    if not _same_records(bundle.sboms, sboms, Sbom, _sbom_key):
+        raise ValueError("bundle SBOMs must exactly match the canonical envelope")
+    return sboms
+
+
+def _same_records[T](
+    actual: object,
+    expected: tuple[T, ...],
+    item_type: type[object],
+    key: Callable[[T], str],
+) -> bool:
+    if not isinstance(actual, tuple) or not all(isinstance(item, item_type) for item in actual):
+        return False
+    records = cast(tuple[T, ...], actual)
+    return tuple(sorted(records, key=key)) == expected
+
+
+def _artifact_key(artifact: Artifact) -> str:
+    return artifact.path.value
+
+
+def _sbom_key(sbom: Sbom) -> str:
+    return sbom.artifact_path.value
+
+
+def _metadata(document: BuildEnvelopeDocument) -> EnvelopeMetadata:
+    channels = tuple(ReleaseChannel(item) for item in document.release_policy.channels)
+    return EnvelopeMetadata(
+        ProjectAdapterVersion(document.project_adapter_version),
+        document.source_date_epoch,
+        ReleasePolicyMetadata(document.release_policy.version, channels),
+        PinnedCompatibility(document.compatibility.dagger, document.compatibility.oras),
+    )
+
+
+def _config_document(bundle: EnvelopeBundle, document: BuildEnvelopeDocument) -> OciConfigDocument:
+    signed = bundle.qualified.envelope.signed
+    unsigned = signed.prequalified.unsigned
+    snapshot = unsigned.source
+    return OciConfigDocument(
+        envelopeSha256=bundle.qualified.envelope.content_sha256.value,
+        qualificationSha256=bundle.qualified.qualification.content_sha256.value,
+        releaseIdempotencyKey=snapshot.release.release_id.idempotency_key,
+        inputSnapshotSha256=snapshot.input_snapshot_sha256.value,
+        signingDisposition=signed.disposition.value,
+        signaturePath=_signature_path(signed),
+        stageOrder=_stage_order(bundle, document),
+    )
+
+
+def _stage_order(bundle: EnvelopeBundle, document: BuildEnvelopeDocument) -> OciStageOrderDocument:
+    signed = bundle.qualified.envelope.signed
+    unsigned = signed.prequalified.unsigned
+    return OciStageOrderDocument(
+        unsignedArtifactOrder=_record_order(unsigned.artifacts, _artifacts(document)),
+        unsignedSbomOrder=_record_order(unsigned.sboms, _sboms(document)),
+        lockOrder=_record_order(unsigned.locks, _locks(document)),
+        toolchainOrder=_record_order(unsigned.toolchains, _toolchains(document)),
+        prequalificationEvidenceOrder=_record_order(
+            signed.prequalified.evidence, _evidence_records(document)
+        ),
+        bundleArtifactOrder=_record_order(bundle.artifacts, _artifacts(document)),
+        bundleSbomOrder=_record_order(bundle.sboms, _sboms(document)),
+    )
+
+
+def _signature_path(signed: SignedBuild) -> str | None:
+    if signed.signature is None:
+        return None
+    return signed.signature.path.value
+
+
+def _record_order[T](records: tuple[T, ...], canonical: tuple[T, ...]) -> tuple[int, ...]:
+    return tuple(canonical.index(item) for item in records)
+
+
+def _local_envelope_document(content: bytes) -> BuildEnvelopeDocument:
+    try:
+        return _parse_envelope(content)
+    except MalformedProviderResponse as error:
+        raise ValueError("bundle envelope bytes must be canonical") from error
+
+
+def _local_qualification_document(content: bytes) -> QualificationRecordDocument:
+    try:
+        return _parse_qualification(content)
+    except MalformedProviderResponse as error:
+        raise ValueError("bundle qualification bytes must be canonical") from error
 
 
 def _validate_repository(repository: str) -> None:
@@ -351,20 +531,20 @@ def _created_timestamp(bundle: EnvelopeBundle) -> str:
     return created.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _input_bytes(bundle: EnvelopeBundle) -> tuple[bytes, ...]:
+def _input_bytes(bundle: _ValidatedBundle) -> tuple[bytes, ...]:
     return (
-        canonical_json_bytes(OciConfigDocument()),
-        bundle.qualified.envelope.canonical_bytes,
-        bundle.qualified.qualification.canonical_bytes,
+        canonical_json_bytes(bundle.config_document),
+        bundle.bundle.qualified.envelope.canonical_bytes,
+        bundle.bundle.qualified.qualification.canonical_bytes,
     )
 
 
-def _expected_layers(bundle: EnvelopeBundle) -> tuple[_ExpectedLayer, ...]:
-    envelope = bundle.qualified.envelope.canonical_bytes
-    qualification = bundle.qualified.qualification.canonical_bytes
+def _expected_layers(bundle: _ValidatedBundle) -> tuple[_ExpectedLayer, ...]:
+    envelope = bundle.bundle.qualified.envelope.canonical_bytes
+    qualification = bundle.bundle.qualified.qualification.canonical_bytes
     return (
         _exact_layer(
-            "config.v1.json", CONFIG_MEDIA_TYPE, canonical_json_bytes(OciConfigDocument())
+            "config.v1.json", CONFIG_MEDIA_TYPE, canonical_json_bytes(bundle.config_document)
         ),
         _exact_layer("build-envelope.v1.json", BUILD_ENVELOPE_MEDIA_TYPE, envelope),
         _exact_layer("qualification-record.v1.json", QUALIFICATION_MEDIA_TYPE, qualification),
@@ -399,19 +579,33 @@ def _blob_fetch(reference: str) -> OrasInvocation:
 
 
 def _manifest_stdout_or_none(result: OrasResult) -> bytes | None:
-    _require_bounded_stderr(result)
-    if result.exit_code == 0:
-        return _bounded_stdout(result.stdout, MAX_MANIFEST_BYTES)
-    if result.exit_code == 1 and _is_not_found(result.stderr):
+    _require_bounded_outputs(result, MAX_MANIFEST_BYTES)
+    if result.outcome is OrasOutcome.SUCCESS:
+        return result.stdout
+    if result.outcome is OrasOutcome.NOT_FOUND:
         return None
     _raise_result_error(result)
 
 
 def _successful_stdout(result: OrasResult, limit: int) -> bytes:
-    _require_bounded_stderr(result)
-    if result.exit_code != 0:
+    _require_bounded_outputs(result, limit)
+    if result.outcome is not OrasOutcome.SUCCESS:
         _raise_result_error(result)
-    return _bounded_stdout(result.stdout, limit)
+    return result.stdout
+
+
+def _successful_exported_file(result: OrasResult) -> bytes:
+    _require_bounded_outputs(result, MAX_PROCESS_STDOUT_BYTES)
+    if result.outcome is not OrasOutcome.SUCCESS:
+        _raise_result_error(result)
+    if result.exported_file_bytes is None:
+        raise MalformedProviderResponse("ORAS push omitted its exported manifest bytes")
+    return _bounded_export(result.exported_file_bytes)
+
+
+def _require_bounded_outputs(result: OrasResult, stdout_limit: int) -> None:
+    _bounded_stdout(result.stdout, stdout_limit)
+    _require_bounded_stderr(result)
 
 
 def _require_bounded_stderr(result: OrasResult) -> None:
@@ -425,22 +619,23 @@ def _bounded_stdout(content: bytes, limit: int) -> bytes:
     return content
 
 
+def _bounded_export(content: bytes) -> bytes:
+    if len(content) > MAX_MANIFEST_BYTES:
+        raise MalformedProviderResponse("ORAS exported manifest exceeded its response bound")
+    return content
+
+
 def _raise_result_error(result: OrasResult) -> NoReturn:
-    if result.exit_code == TIMEOUT_EXIT_CODE:
+    if result.outcome is OrasOutcome.TIMEOUT:
         raise ProviderTimeout("ORAS provider execution timed out")
     raise ProviderUnavailable("ORAS provider execution failed")
-
-
-def _is_not_found(stderr: bytes) -> bool:
-    lowered = stderr.lower()
-    return b"not found" in lowered or b"manifest unknown" in lowered
 
 
 def _parse_manifest(content: bytes) -> _Observation:
     bounded = _bounded_stdout(content, MAX_MANIFEST_BYTES)
     try:
-        manifest = _Manifest.model_validate_json(bounded)
-    except ValidationError as error:
+        manifest = _Manifest.model_validate(parse_bounded_json(bounded, MAX_MANIFEST_BYTES))
+    except (ValidationError, ValueError) as error:
         raise MalformedProviderResponse("ORAS returned a malformed OCI manifest") from error
     _validate_manifest_layers(manifest)
     return _Observation(bounded, Sha256Digest.from_bytes(bounded), manifest)
@@ -449,6 +644,8 @@ def _parse_manifest(content: bytes) -> _Observation:
 def _validate_manifest_layers(manifest: _Manifest) -> None:
     if manifest.config.media_type != CONFIG_MEDIA_TYPE:
         raise MalformedProviderResponse("OCI manifest has an unexpected config media type")
+    if manifest.config.annotations:
+        raise MalformedProviderResponse("OCI config descriptor has unexpected annotations")
     if len(manifest.layers) < REQUIRED_CORE_LAYERS:
         raise MalformedProviderResponse("OCI manifest is missing required envelope layers")
     _require_core_layer(manifest.layers[0], "build-envelope.v1.json", BUILD_ENVELOPE_MEDIA_TYPE)
@@ -459,7 +656,7 @@ def _validate_manifest_layers(manifest: _Manifest) -> None:
 
 
 def _require_core_layer(descriptor: _Descriptor, title: str, media_type: str) -> None:
-    if _normalized_title(descriptor.title) != title or descriptor.media_type != media_type:
+    if descriptor.title != title or descriptor.media_type != media_type:
         raise MalformedProviderResponse("OCI manifest has an unexpected required layer")
 
 
@@ -472,6 +669,14 @@ def _require_unique_layer_titles(layers: tuple[_Descriptor, ...]) -> None:
 def _require_declared_manifest(reference: OciReference, digest: Sha256Digest) -> None:
     if reference.manifest_sha256 is not None and reference.manifest_sha256 != digest:
         raise ArtifactConflict("declared OCI manifest digest conflicts with provider bytes")
+
+
+def _require_post_push_manifest(
+    exported: _Observation, observed: _Observation | None
+) -> _Observation:
+    if observed is None or observed.content != exported.content:
+        raise ArtifactConflict("post-push OCI tag differs from exported manifest bytes")
+    return observed
 
 
 def _require_created_annotation(
@@ -501,7 +706,7 @@ def _require_descriptor(
     expected: _ExpectedLayer,
     conflict_type: type[OrasAdapterError],
 ) -> None:
-    identity = (_normalized_title(descriptor.title), descriptor.media_type, descriptor.digest)
+    identity = (descriptor.title, descriptor.media_type, descriptor.digest)
     wanted = (_expected_title(expected), expected.media_type, expected.digest.value)
     if identity != wanted or (expected.size is not None and descriptor.size != expected.size):
         raise conflict_type("OCI content tag has conflicting descriptor bytes")
@@ -511,12 +716,6 @@ def _expected_title(expected: _ExpectedLayer) -> str | None:
     if expected.path == "config.v1.json":
         return None
     return expected.path
-
-
-def _normalized_title(title: str | None) -> str | None:
-    if title is None:
-        return None
-    return title.removeprefix("/work/")
 
 
 def _require_blob(
@@ -557,6 +756,11 @@ def _require_descriptor_bytes(
             raise MalformedProviderResponse("OCI blob bytes do not match their descriptor")
 
 
+def _require_bounded_blob_size(size: int) -> None:
+    if size > MAX_BLOB_BYTES:
+        raise MalformedProviderResponse("OCI blob descriptor size exceeded its response bound")
+
+
 def _stored(reference: OciReference, observation: _Observation | None) -> StoredEnvelope | None:
     if observation is None:
         return None
@@ -573,28 +777,54 @@ def _tag_reference(reference: OciReference) -> str:
 
 
 def _restore_bundle(manifest: _Manifest, contents: tuple[bytes, ...]) -> EnvelopeBundle:
+    config = _parse_config(contents[0])
     envelope_bytes, qualification_bytes = contents[1:3]
     envelope_document = _parse_envelope(envelope_bytes)
     qualification_document = _parse_qualification(qualification_bytes)
-    artifacts = tuple(_artifact(item) for item in envelope_document.artifacts)
-    sboms = tuple(_sbom(item) for item in envelope_document.sboms)
     bundle = _validated_assembly(
-        envelope_document, qualification_document, envelope_bytes, qualification_bytes
+        config, envelope_document, qualification_document, envelope_bytes, qualification_bytes
     )
-    _require_descriptors(manifest, _expected_layers(bundle), MalformedProviderResponse)
-    return EnvelopeBundle(bundle.qualified, artifacts, sboms)
+    validated = _validated_restored_bundle(bundle, config)
+    _require_created_annotation(manifest, bundle, MalformedProviderResponse)
+    _require_descriptors(manifest, _expected_layers(validated), MalformedProviderResponse)
+    return bundle
 
 
 def _validated_assembly(
+    config: OciConfigDocument,
     document: BuildEnvelopeDocument,
     qualification: QualificationRecordDocument,
     envelope_bytes: bytes,
     qualification_bytes: bytes,
 ) -> EnvelopeBundle:
     try:
-        return _assembled_bundle(document, qualification, envelope_bytes, qualification_bytes)
+        return _assembled_bundle(
+            config, document, qualification, envelope_bytes, qualification_bytes
+        )
     except ValueError as error:
         raise MalformedProviderResponse("stored envelope records are inconsistent") from error
+
+
+def _validated_restored_bundle(
+    bundle: EnvelopeBundle, config: OciConfigDocument
+) -> _ValidatedBundle:
+    try:
+        validated = _validate_bundle(bundle)
+    except ValueError as error:
+        raise MalformedProviderResponse("stored envelope graph is inconsistent") from error
+    if validated.config_document != config:
+        raise MalformedProviderResponse("stored config does not match the envelope graph")
+    return validated
+
+
+def _parse_config(content: bytes) -> OciConfigDocument:
+    try:
+        document = OciConfigDocument.model_validate(parse_bounded_json(content, MAX_MANIFEST_BYTES))
+    except (ValidationError, ValueError) as error:
+        raise MalformedProviderResponse("stored OCI config is malformed") from error
+    if canonical_json_bytes(document) != content:
+        raise MalformedProviderResponse("stored OCI config is not canonical")
+    return document
 
 
 def _parse_envelope(content: bytes) -> BuildEnvelopeDocument:
@@ -618,17 +848,20 @@ def _parse_qualification(content: bytes) -> QualificationRecordDocument:
 
 
 def _assembled_bundle(
+    config: OciConfigDocument,
     document: BuildEnvelopeDocument,
     qualification: QualificationRecordDocument,
     envelope_bytes: bytes,
     qualification_bytes: bytes,
 ) -> EnvelopeBundle:
-    signed = _signed_build(document)
+    signed = _signed_build(document, config)
     envelope_digest = Sha256Digest.from_bytes(envelope_bytes)
     envelope = BuildEnvelope(signed, document, envelope_bytes, envelope_digest)
     record = _qualification_record(qualification, qualification_bytes)
     qualified = QualifiedEnvelope(envelope, record)
-    return EnvelopeBundle(qualified, _artifacts(document), _sboms(document))
+    artifacts = _ordered(_artifacts(document), config.stage_order.bundle_artifact_order)
+    sboms = _ordered(_sboms(document), config.stage_order.bundle_sbom_order)
+    return EnvelopeBundle(qualified, artifacts, sboms)
 
 
 def _qualification_record(
@@ -642,21 +875,50 @@ def _qualification_record(
     )
 
 
-def _signed_build(document: BuildEnvelopeDocument) -> SignedBuild:
+def _signed_build(document: BuildEnvelopeDocument, config: OciConfigDocument) -> SignedBuild:
     artifacts = _artifacts(document)
-    unsigned = UnsignedBuild(
-        _snapshot(document),
-        artifacts,
-        _sboms(document),
-        tuple(_lock(item) for item in document.locks),
-        tuple(_toolchain(item) for item in document.toolchains),
+    signature = _signature_artifact(artifacts, config)
+    unsigned_artifacts = _ordered(artifacts, config.stage_order.unsigned_artifact_order)
+    unsigned = _unsigned_build(document, config, unsigned_artifacts)
+    evidence = _ordered(
+        _evidence_records(document), config.stage_order.prequalification_evidence_order
     )
-    evidence = tuple(_evidence(item) for item in document.prequalification_evidence)
     prequalified = PrequalifiedBuild(unsigned, evidence)
-    return SignedBuild(prequalified, None, SigningDisposition.SIGNING_NOT_REQUIRED)
+    return SignedBuild(prequalified, signature, SigningDisposition(config.signing_disposition))
 
 
-def _snapshot(document: BuildEnvelopeDocument) -> SnapshottedSource:
+def _unsigned_build(
+    document: BuildEnvelopeDocument,
+    config: OciConfigDocument,
+    artifacts: tuple[Artifact, ...],
+) -> UnsignedBuild:
+    return UnsignedBuild(
+        _snapshot(document, config),
+        artifacts,
+        _ordered(_sboms(document), config.stage_order.unsigned_sbom_order),
+        _ordered(_locks(document), config.stage_order.lock_order),
+        _ordered(_toolchains(document), config.stage_order.toolchain_order),
+    )
+
+
+def _ordered[T](records: tuple[T, ...], order: tuple[int, ...]) -> tuple[T, ...]:
+    if len(set(order)) != len(order) or any(index >= len(records) for index in order):
+        raise ValueError("stored config order must select unique existing records")
+    return tuple(records[index] for index in order)
+
+
+def _signature_artifact(
+    artifacts: tuple[Artifact, ...], config: OciConfigDocument
+) -> Artifact | None:
+    if config.signature_path is None:
+        return None
+    matches = tuple(item for item in artifacts if item.path.value == config.signature_path)
+    if len(matches) != 1:
+        raise ValueError("signed config signature path must identify exactly one artifact")
+    return matches[0]
+
+
+def _snapshot(document: BuildEnvelopeDocument, config: OciConfigDocument) -> SnapshottedSource:
     source = document.source
     project = ProjectId(source.project)
     digest = Sha256Digest(source.source_tree_sha256)
@@ -667,9 +929,10 @@ def _snapshot(document: BuildEnvelopeDocument) -> SnapshottedSource:
         project,
         document.release_policy.version,
         digest,
-        f"{project.value}-{document.release_policy.version}",
+        config.release_idempotency_key,
     )
-    return SnapshottedSource(ReleaseSource(release_id, revision), digest)
+    snapshot = Sha256Digest(config.input_snapshot_sha256)
+    return SnapshottedSource(ReleaseSource(release_id, revision), snapshot)
 
 
 def _artifacts(document: BuildEnvelopeDocument) -> tuple[Artifact, ...]:
@@ -703,8 +966,16 @@ def _lock(document: LockDocument) -> LockIdentity:
     return LockIdentity(ArtifactPath(document.path), Sha256Digest(document.sha256))
 
 
+def _locks(document: BuildEnvelopeDocument) -> tuple[LockIdentity, ...]:
+    return tuple(_lock(item) for item in document.locks)
+
+
 def _toolchain(document: ToolchainDocument) -> ToolchainIdentity:
     return ToolchainIdentity(document.name, document.version, Sha256Digest(document.sha256))
+
+
+def _toolchains(document: BuildEnvelopeDocument) -> tuple[ToolchainIdentity, ...]:
+    return tuple(_toolchain(item) for item in document.toolchains)
 
 
 def _evidence(document: EvidenceDocument) -> Evidence:
@@ -714,3 +985,7 @@ def _evidence(document: EvidenceDocument) -> Evidence:
         Sha256Digest(document.subject),
         EvidenceStatus(document.status),
     )
+
+
+def _evidence_records(document: BuildEnvelopeDocument) -> tuple[Evidence, ...]:
+    return tuple(_evidence(item) for item in document.prequalification_evidence)

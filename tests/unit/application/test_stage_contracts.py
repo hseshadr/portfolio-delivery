@@ -20,6 +20,7 @@ from portfolio_delivery.domain.stages import (
     InputSnapshotPlan,
     OciReference,
     OrasInvocation,
+    OrasOutcome,
     OrasResult,
     PrequalifiedBuild,
     QualificationRecord,
@@ -236,7 +237,33 @@ def test_should_reject_invalid_oci_and_oras_boundary_values_when_records_are_cre
     with pytest.raises(InvalidIdentity):
         OrasInvocation(("oras",), cast(tuple[bytes, ...], [b"payload"]))
     with pytest.raises(InvalidIdentity):
-        OrasResult(True, b"", b"")
+        OrasResult(True, OrasOutcome.FAILURE, b"", b"")
+
+
+@pytest.mark.parametrize(
+    "factory",
+    (
+        lambda: OrasResult(0, cast(OrasOutcome, "success"), b"", b""),
+        lambda: OrasResult(1, OrasOutcome.SUCCESS, b"", b""),
+        lambda: OrasResult(0, OrasOutcome.NOT_FOUND, b"", b""),
+        lambda: OrasResult(0, OrasOutcome.SUCCESS, b"", b"", cast(bytes, "manifest")),
+    ),
+)
+def test_should_reject_incoherent_oras_result_when_record_is_created(
+    factory: Callable[[], OrasResult],
+) -> None:
+    # Given / When / Then
+    with pytest.raises(InvalidIdentity):
+        factory()
+
+
+def test_should_keep_process_and_exported_bytes_distinct_when_oras_succeeds() -> None:
+    # Given / When
+    result = OrasResult(0, OrasOutcome.SUCCESS, b"progress", b"", b"manifest")
+
+    # Then
+    assert result.stdout == b"progress"
+    assert result.exported_file_bytes == b"manifest"
 
 
 def test_should_keep_exact_stage_bytes_when_envelope_bundle_is_created() -> None:

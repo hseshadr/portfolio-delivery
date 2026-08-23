@@ -12,6 +12,7 @@ from portfolio_delivery.adapters.oras import (
     ArtifactConflict,
     MalformedProviderResponse,
     OrasAdapter,
+    ProviderTimeout,
     ProviderUnavailable,
 )
 from portfolio_delivery.domain.artifacts import Artifact, Evidence, EvidenceStatus, Sbom
@@ -23,9 +24,12 @@ from portfolio_delivery.domain.identity import (
     SourceRevision,
 )
 from portfolio_delivery.domain.stages import (
+    BuildEnvelope,
     EnvelopeBundle,
     OciReference,
+    OrasOutcome,
     PrequalifiedBuild,
+    QualificationRecord,
     QualifiedEnvelope,
     ReleaseSource,
     SignedBuild,
@@ -42,13 +46,20 @@ from portfolio_delivery.envelope.builder import (
     ReleaseChannel,
     ReleasePolicyMetadata,
 )
+from portfolio_delivery.envelope.canonical import canonical_json_bytes
+from portfolio_delivery.envelope.documents import EvidenceDocument, QualificationRecordDocument
 from tests.fakes.oras import FakeFile, FakeOrasRunner
 
 REPOSITORY: Final[str] = "ghcr.io/hseshadr/delivery"
 ARTIFACT_BYTES: Final[bytes] = b"wheel"
 SBOM_BYTES: Final[bytes] = b'{"bomFormat":"CycloneDX"}\n'
 MAX_MANIFEST_BYTES: Final[int] = 1_048_576
-EXPECTED_INITIAL_OBSERVATIONS: Final[int] = 2
+MAX_PROCESS_OUTPUT_BYTES: Final[int] = 65_536
+EXPECTED_INITIAL_OBSERVATIONS: Final[int] = 8
+OVERSIZED_BLOB: Final[int] = 1_073_741_825
+SECOND_ARTIFACT_BYTES: Final[bytes] = b"second-wheel"
+SECOND_SBOM_BYTES: Final[bytes] = b'{"bomFormat":"CycloneDX","serialNumber":"two"}\n'
+SIGNATURE_BYTES: Final[bytes] = b"detached-signature"
 EXPECTED_PUSH_PREFIX: Final[tuple[str, ...]] = (
     "oras",
     "push",
@@ -95,11 +106,36 @@ def make_source() -> SnapshottedSource:
 def make_bundle() -> EnvelopeBundle:
     artifact = make_artifact()
     sbom = make_sbom(artifact)
-    signed = make_signed(artifact, sbom)
+    return make_bundle_from((artifact,), (sbom,))
+
+
+def make_bundle_from(artifacts: tuple[Artifact, ...], sboms: tuple[Sbom, ...]) -> EnvelopeBundle:
+    signed = make_signed(artifacts, sboms)
     envelope = EnvelopeBuilder(make_metadata()).build(signed)
     final = Evidence("archive", "manifest", envelope.content_sha256, EvidenceStatus.PASSED)
     qualified = QualifiedEnvelope(envelope, QualificationBuilder().build(envelope, (final,)))
-    return EnvelopeBundle(qualified, (artifact,), (sbom,))
+    return EnvelopeBundle(qualified, artifacts, sboms)
+
+
+def make_signed_bundle() -> EnvelopeBundle:
+    artifact = make_artifact()
+    signature = Artifact(
+        "signature",
+        ArtifactPath("signatures/package.sig"),
+        "application/vnd.dev.sigstore.bundle+json",
+        len(SIGNATURE_BYTES),
+        make_digest(SIGNATURE_BYTES),
+    )
+    prequalified = make_signed((artifact,), (make_sbom(artifact),)).prequalified
+    signed = SignedBuild(prequalified, signature, SigningDisposition.SIGNED)
+    return make_qualified_bundle(signed, (artifact, signature))
+
+
+def make_qualified_bundle(signed: SignedBuild, artifacts: tuple[Artifact, ...]) -> EnvelopeBundle:
+    envelope = EnvelopeBuilder(make_metadata()).build(signed)
+    evidence = Evidence("archive", "manifest", envelope.content_sha256, EvidenceStatus.PASSED)
+    qualified = QualifiedEnvelope(envelope, QualificationBuilder().build(envelope, (evidence,)))
+    return EnvelopeBundle(qualified, artifacts, signed.prequalified.unsigned.sboms)
 
 
 def make_artifact() -> Artifact:
@@ -121,13 +157,35 @@ def make_sbom(artifact: Artifact) -> Sbom:
     )
 
 
-def make_signed(artifact: Artifact, sbom: Sbom) -> SignedBuild:
-    unsigned = UnsignedBuild(make_source(), (artifact,), (sbom,), (), ())
+def make_signed(artifacts: tuple[Artifact, ...], sboms: tuple[Sbom, ...]) -> SignedBuild:
+    unsigned = UnsignedBuild(make_source(), artifacts, sboms, (), ())
     precheck = Evidence("test", "unit", make_digest(b"check"), EvidenceStatus.PASSED)
     return SignedBuild(
         PrequalifiedBuild(unsigned, (precheck,)),
         None,
         SigningDisposition.SIGNING_NOT_REQUIRED,
+    )
+
+
+def make_two_artifact_bundle() -> EnvelopeBundle:
+    first = make_artifact()
+    second = make_second_artifact()
+    second_sbom = Sbom(
+        second.path,
+        ArtifactPath("sbom/second.cdx.json"),
+        "application/vnd.cyclonedx+json",
+        make_digest(SECOND_SBOM_BYTES),
+    )
+    return make_bundle_from((second, first), (second_sbom, make_sbom(first)))
+
+
+def make_second_artifact() -> Artifact:
+    return Artifact(
+        "second",
+        ArtifactPath("artifacts/second.whl"),
+        "application/zip",
+        len(SECOND_ARTIFACT_BYTES),
+        make_digest(SECOND_ARTIFACT_BYTES),
     )
 
 
@@ -199,6 +257,53 @@ async def test_should_push_once_and_reinspect_when_content_tag_is_absent() -> No
 
 
 @pytest.mark.asyncio
+async def test_should_reject_concurrent_tag_overwrite_after_push() -> None:
+    scenario = make_scenario()
+    scenario.runner.overwrite_after_push = True
+
+    with pytest.raises(ArtifactConflict, match="post-push"):
+        await scenario.adapter.persist(scenario.bundle, "attempt-race")
+    assert scenario.runner.write_count == 1
+
+
+@pytest.mark.asyncio
+async def test_should_keep_process_stdout_distinct_from_exported_manifest() -> None:
+    scenario = make_scenario()
+    scenario.runner.push_stdout = b"provider progress"
+
+    stored = await scenario.adapter.persist(scenario.bundle, "attempt-distinct-export")
+
+    assert stored.reference.manifest_sha256 == stored.manifest_sha256
+
+
+@pytest.mark.asyncio
+async def test_should_reject_push_that_omits_exported_manifest() -> None:
+    scenario = make_scenario()
+    scenario.runner.omit_exported_file = True
+
+    with pytest.raises(MalformedProviderResponse, match="omitted"):
+        await scenario.adapter.persist(scenario.bundle, "attempt-missing-export")
+
+
+@pytest.mark.asyncio
+async def test_should_reject_oversized_exported_manifest() -> None:
+    scenario = make_scenario()
+    scenario.runner.exported_file_override = b"x" * (MAX_MANIFEST_BYTES + 1)
+
+    with pytest.raises(MalformedProviderResponse, match="exported"):
+        await scenario.adapter.persist(scenario.bundle, "attempt-oversized-export")
+
+
+@pytest.mark.asyncio
+async def test_should_reject_oversized_process_stderr() -> None:
+    scenario = make_scenario()
+    scenario.runner.push_stderr = b"x" * (MAX_PROCESS_OUTPUT_BYTES + 1)
+
+    with pytest.raises(MalformedProviderResponse, match="stderr"):
+        await scenario.adapter.persist(scenario.bundle, "attempt-oversized-stderr")
+
+
+@pytest.mark.asyncio
 async def test_should_not_push_when_content_tag_has_identical_bytes() -> None:
     scenario = make_scenario()
     first = await scenario.adapter.persist(scenario.bundle, "attempt-first")
@@ -249,6 +354,53 @@ async def test_should_reject_conflicting_created_annotation_without_takeover() -
 
 
 @pytest.mark.asyncio
+async def test_should_reject_missing_bundle_artifact_before_write() -> None:
+    scenario = make_scenario()
+    poisoned = replace(scenario.bundle, artifacts=())
+
+    with pytest.raises(ValueError, match="bundle"):
+        await scenario.adapter.persist(poisoned, "attempt-missing-artifact")
+    assert scenario.runner.write_count == 0
+    assert not scenario.runner.invocations
+
+
+@pytest.mark.asyncio
+async def test_should_reject_unbound_qualification_before_write() -> None:
+    scenario = make_scenario()
+    poisoned = poison_qualification(scenario.bundle)
+
+    with pytest.raises(ValueError, match="qualification"):
+        await scenario.adapter.persist(poisoned, "attempt-poison-qualification")
+    assert scenario.runner.write_count == 0
+    assert not scenario.runner.invocations
+
+
+@pytest.mark.asyncio
+async def test_should_reject_unrecorded_signing_fact_before_write() -> None:
+    scenario = make_scenario()
+    poisoned = poison_signing(scenario.bundle)
+
+    with pytest.raises(ValueError, match="envelope"):
+        await scenario.adapter.persist(poisoned, "attempt-poison-signing")
+    assert scenario.runner.write_count == 0
+    assert not scenario.runner.invocations
+
+
+def test_should_plan_canonical_layers_when_bundle_tuples_are_reordered() -> None:
+    bundle = make_two_artifact_bundle()
+    reordered = replace(
+        bundle, artifacts=tuple(reversed(bundle.artifacts)), sboms=tuple(reversed(bundle.sboms))
+    )
+    adapter = OrasAdapter(FakeOrasRunner(), REPOSITORY)
+
+    first = adapter.plan_push(bundle)
+    second = adapter.plan_push(reordered)
+
+    assert first.argv == second.argv
+    assert first.input_bytes[1:] == second.input_bytes[1:]
+
+
+@pytest.mark.asyncio
 async def test_should_recover_by_inspection_when_push_times_out_after_write() -> None:
     scenario = make_scenario()
     scenario.runner.timeout_after_write = True
@@ -258,6 +410,17 @@ async def test_should_recover_by_inspection_when_push_times_out_after_write() ->
     assert stored.reference.tag == content_reference(scenario.bundle).tag
     assert scenario.runner.write_count == 1
     assert sum(item.argv[1] == "push" for item, _ in scenario.runner.invocations) == 1
+
+
+@pytest.mark.asyncio
+async def test_should_surface_timeout_when_push_did_not_write() -> None:
+    scenario = make_scenario()
+    scenario.runner.timeout_before_write = True
+
+    with pytest.raises(ProviderTimeout):
+        await scenario.adapter.persist(scenario.bundle, "attempt-timeout-before-write")
+
+    assert scenario.runner.write_count == 0
 
 
 @pytest.mark.asyncio
@@ -285,6 +448,19 @@ async def test_should_reject_invalid_layer_manifest(mutation: str) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ("duplicate-key", "unexpected-annotation", "absolute-title"))
+async def test_should_reject_noncanonical_manifest_descriptor(mutation: str) -> None:
+    scenario = make_scenario()
+    await scenario.adapter.persist(scenario.bundle, "attempt-seed")
+    reference = f"{REPOSITORY}:{content_reference(scenario.bundle).tag}"
+    content = mutate_descriptor(scenario.runner.manifests[reference], mutation)
+    scenario.runner.put_manifest(reference, content)
+
+    with pytest.raises(MalformedProviderResponse):
+        await scenario.adapter.inspect(content_reference(scenario.bundle), "attempt-descriptor")
+
+
+@pytest.mark.asyncio
 async def test_should_reject_remote_manifest_that_differs_at_digest_reference() -> None:
     scenario = make_scenario()
     await scenario.adapter.persist(scenario.bundle, "attempt-seed")
@@ -304,16 +480,47 @@ async def test_should_restore_exact_envelope_and_payload_metadata() -> None:
     assert_restored_bundle(restored, scenario.bundle)
 
 
+@pytest.mark.asyncio
+async def test_should_restore_exact_signed_stage_graph() -> None:
+    bundle = make_signed_bundle()
+    runner = FakeOrasRunner(
+        (
+            FakeFile("artifacts/package.whl", ARTIFACT_BYTES),
+            FakeFile("sbom/package.cdx.json", SBOM_BYTES),
+            FakeFile("signatures/package.sig", SIGNATURE_BYTES),
+        )
+    )
+    adapter = OrasAdapter(runner, REPOSITORY)
+
+    stored = await adapter.persist(bundle, "attempt-signed-write")
+    restored = await adapter.restore(stored.reference, "attempt-signed-restore")
+
+    assert restored == bundle
+
+
+@pytest.mark.asyncio
+async def test_should_restore_exact_reordered_stage_graph() -> None:
+    bundle = make_two_artifact_bundle()
+    runner = FakeOrasRunner(two_artifact_files())
+    adapter = OrasAdapter(runner, REPOSITORY)
+
+    stored = await adapter.persist(bundle, "attempt-reordered-write")
+    restored = await adapter.restore(stored.reference, "attempt-reordered-restore")
+
+    assert restored == bundle
+
+
+def two_artifact_files() -> tuple[FakeFile, ...]:
+    return (
+        FakeFile("artifacts/package.whl", ARTIFACT_BYTES),
+        FakeFile("artifacts/second.whl", SECOND_ARTIFACT_BYTES),
+        FakeFile("sbom/package.cdx.json", SBOM_BYTES),
+        FakeFile("sbom/second.cdx.json", SECOND_SBOM_BYTES),
+    )
+
+
 def assert_restored_bundle(restored: EnvelopeBundle, expected: EnvelopeBundle) -> None:
-    assert (
-        restored.qualified.envelope.canonical_bytes == expected.qualified.envelope.canonical_bytes
-    )
-    assert (
-        restored.qualified.qualification.canonical_bytes
-        == expected.qualified.qualification.canonical_bytes
-    )
-    assert restored.artifacts == expected.artifacts
-    assert restored.sboms == expected.sboms
+    assert restored == expected
 
 
 @pytest.mark.asyncio
@@ -323,6 +530,43 @@ async def test_should_fail_closed_when_provider_is_unavailable() -> None:
 
     with pytest.raises(ProviderUnavailable):
         await scenario.adapter.restore(reference, "attempt-unavailable")
+
+
+@pytest.mark.asyncio
+async def test_should_treat_only_typed_not_found_as_absent() -> None:
+    scenario = make_scenario()
+    reference = content_reference(scenario.bundle)
+    scenario.runner.missing_stderr = b"opaque provider text"
+
+    assert await scenario.adapter.inspect(reference, "attempt-not-found") is None
+
+    scenario.runner.missing_outcome = OrasOutcome.FAILURE
+    scenario.runner.missing_stderr = b"manifest unknown: not found"
+    with pytest.raises(ProviderUnavailable):
+        await scenario.adapter.inspect(reference, "attempt-failure")
+
+
+@pytest.mark.asyncio
+async def test_should_bound_stdout_even_when_provider_fails() -> None:
+    scenario = make_scenario()
+    scenario.runner.missing_outcome = OrasOutcome.FAILURE
+    scenario.runner.missing_stdout = b"x" * (MAX_MANIFEST_BYTES + 1)
+
+    with pytest.raises(MalformedProviderResponse, match="stdout"):
+        await scenario.adapter.inspect(content_reference(scenario.bundle), "attempt-stdout-bound")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", (len(SBOM_BYTES) + 1, OVERSIZED_BLOB))
+async def test_should_reject_invalid_or_unbounded_blob_descriptor_size(size: int) -> None:
+    scenario = make_scenario()
+    await scenario.adapter.persist(scenario.bundle, "attempt-seed")
+    reference = f"{REPOSITORY}:{content_reference(scenario.bundle).tag}"
+    mutated = mutate_sbom_size(scenario.runner.manifests[reference], size)
+    scenario.runner.put_manifest(reference, mutated)
+
+    with pytest.raises(MalformedProviderResponse, match="size"):
+        await scenario.adapter.persist(scenario.bundle, "attempt-size")
 
 
 @pytest.mark.parametrize("repository", ("https://ghcr.io/repo", "UPPER/repo", "x" * 256))
@@ -346,7 +590,7 @@ async def test_should_reject_noncanonical_tag_before_provider_execution() -> Non
 def test_should_reject_unbounded_layer_media_type_before_push() -> None:
     scenario = make_scenario()
     artifact = replace(scenario.bundle.artifacts[0], media_type="x" * 256)
-    bundle = replace(scenario.bundle, artifacts=(artifact,))
+    bundle = make_bundle_from((artifact,), scenario.bundle.sboms)
 
     with pytest.raises(ValueError, match="media type"):
         scenario.adapter.plan_push(bundle)
@@ -355,7 +599,8 @@ def test_should_reject_unbounded_layer_media_type_before_push() -> None:
 def test_should_reject_unbounded_layer_path_before_push() -> None:
     scenario = make_scenario()
     artifact = replace(scenario.bundle.artifacts[0], path=ArtifactPath("a" * 4_097))
-    bundle = replace(scenario.bundle, artifacts=(artifact,))
+    sbom = replace(scenario.bundle.sboms[0], artifact_path=artifact.path)
+    bundle = make_bundle_from((artifact,), (sbom,))
 
     with pytest.raises(ValueError, match="path"):
         scenario.adapter.plan_push(bundle)
@@ -382,4 +627,54 @@ def mutate_layers(content: bytes, mutation: str) -> bytes:
         layers.pop(0)
     else:
         layers.append(layers[0])
+    return json.dumps(document, separators=(",", ":"), sort_keys=True).encode()
+
+
+def poison_qualification(bundle: EnvelopeBundle) -> EnvelopeBundle:
+    envelope = bundle.qualified.envelope
+    evidence = EvidenceDocument(
+        kind="archive", name="manifest", subject=make_digest(b"wrong").value, status="passed"
+    )
+    document = QualificationRecordDocument(
+        subject=envelope.content_sha256.value, qualificationEvidence=(evidence,)
+    )
+    content = canonical_json_bytes(document)
+    record = QualificationRecord(
+        envelope.content_sha256, document, content, Sha256Digest.from_bytes(content)
+    )
+    return replace(bundle, qualified=QualifiedEnvelope(envelope, record))
+
+
+def poison_signing(bundle: EnvelopeBundle) -> EnvelopeBundle:
+    envelope = bundle.qualified.envelope
+    signature = Artifact(
+        "signature",
+        ArtifactPath("signatures/package.sig"),
+        "application/signature",
+        3,
+        make_digest(b"sig"),
+    )
+    signed = SignedBuild(envelope.signed.prequalified, signature, SigningDisposition.SIGNED)
+    poisoned = BuildEnvelope(
+        signed, envelope.document, envelope.canonical_bytes, envelope.content_sha256
+    )
+    qualified = QualifiedEnvelope(poisoned, bundle.qualified.qualification)
+    return replace(bundle, qualified=qualified)
+
+
+def mutate_descriptor(content: bytes, mutation: str) -> bytes:
+    if mutation == "duplicate-key":
+        return content.replace(b'"schemaVersion":2', b'"schemaVersion":2,"schemaVersion":2', 1)
+    document = json.loads(content)
+    if mutation == "unexpected-annotation":
+        document["layers"][0]["annotations"]["unexpected"] = "value"
+    else:
+        title = document["layers"][0]["annotations"]["org.opencontainers.image.title"]
+        document["layers"][0]["annotations"]["org.opencontainers.image.title"] = f"/work/{title}"
+    return json.dumps(document, separators=(",", ":"), sort_keys=True).encode()
+
+
+def mutate_sbom_size(content: bytes, size: int) -> bytes:
+    document = json.loads(content)
+    document["layers"][-1]["size"] = size
     return json.dumps(document, separators=(",", ":"), sort_keys=True).encode()

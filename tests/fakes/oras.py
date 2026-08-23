@@ -6,7 +6,12 @@ import json
 from dataclasses import dataclass
 from hashlib import sha256
 
-from portfolio_delivery.domain.stages import OrasInvocation, OrasResult, validate_attempt_id
+from portfolio_delivery.domain.stages import (
+    OrasInvocation,
+    OrasOutcome,
+    OrasResult,
+    validate_attempt_id,
+)
 
 _MANIFEST_MEDIA_TYPE = "application/vnd.oci.image.manifest.v1+json"
 _TITLE = "org.opencontainers.image.title"
@@ -28,8 +33,23 @@ class FakeOrasRunner:
         self.blobs: dict[str, bytes] = {}
         self.write_count = 0
         self.observation_count = 0
+        self._initialize_controls()
+        self._initialize_outputs()
+
+    def _initialize_controls(self) -> None:
+        self.timeout_before_write = False
         self.timeout_after_write = False
+        self.overwrite_after_push = False
+        self.omit_exported_file = False
+
+    def _initialize_outputs(self) -> None:
         self.digest_manifest_override: bytes | None = None
+        self.push_stdout = b"pushed"
+        self.push_stderr = b""
+        self.exported_file_override: bytes | None = None
+        self.missing_outcome = OrasOutcome.NOT_FOUND
+        self.missing_stdout = b""
+        self.missing_stderr = b"manifest unavailable"
 
     async def run(self, invocation: OrasInvocation, attempt_id: str) -> OrasResult:
         validate_attempt_id(attempt_id)
@@ -41,7 +61,7 @@ class FakeOrasRunner:
             return self._fetch_manifest(invocation.argv[-1])
         if command == ("blob", "fetch"):
             return self._fetch_blob(invocation.argv[-1])
-        return OrasResult(2, b"", b"unsupported fake ORAS command")
+        return OrasResult(2, OrasOutcome.FAILURE, b"", b"unsupported fake ORAS command")
 
     def put_manifest(self, reference: str, content: bytes) -> None:
         self.manifests[reference] = content
@@ -51,14 +71,19 @@ class FakeOrasRunner:
             self.manifests[f"{repository}@{digest}"] = content
 
     def _push(self, invocation: OrasInvocation) -> OrasResult:
+        if self.timeout_before_write:
+            return OrasResult(124, OrasOutcome.TIMEOUT, b"", b"provider timed out")
         target = _push_target(invocation.argv)
         contents = self._input_contents(invocation)
         manifest = _manifest_bytes(invocation.argv, contents)
         self._store(target, manifest, invocation.argv, contents)
+        if self.overwrite_after_push:
+            self.put_manifest(target, _overwrite_manifest(manifest))
         if self.timeout_after_write:
             self.timeout_after_write = False
-            return OrasResult(124, b"", b"provider timed out")
-        return OrasResult(0, manifest, b"")
+            return OrasResult(124, OrasOutcome.TIMEOUT, b"", b"provider timed out")
+        exported = _exported_file(self, manifest)
+        return OrasResult(0, OrasOutcome.SUCCESS, self.push_stdout, self.push_stderr, exported)
 
     def _input_contents(self, invocation: OrasInvocation) -> tuple[bytes, ...]:
         planned = dict(zip(_planned_input_paths(), invocation.input_bytes, strict=True))
@@ -80,16 +105,22 @@ class FakeOrasRunner:
         self.observation_count += 1
         content = self.manifests.get(reference)
         if content is None:
-            return OrasResult(1, b"", b"manifest unknown: not found")
+            return OrasResult(
+                _failure_code(self.missing_outcome),
+                self.missing_outcome,
+                self.missing_stdout,
+                self.missing_stderr,
+            )
         if "@sha256:" in reference and self.digest_manifest_override is not None:
             content = self.digest_manifest_override
-        return OrasResult(0, content, b"")
+        return OrasResult(0, OrasOutcome.SUCCESS, content, b"")
 
     def _fetch_blob(self, reference: str) -> OrasResult:
+        self.observation_count += 1
         content = self.blobs.get(reference)
         if content is None:
-            return OrasResult(1, b"", b"blob unknown: not found")
-        return OrasResult(0, content, b"")
+            return OrasResult(1, OrasOutcome.NOT_FOUND, b"", b"blob unavailable")
+        return OrasResult(0, OrasOutcome.SUCCESS, content, b"")
 
 
 def _planned_input_paths() -> tuple[str, ...]:
@@ -158,3 +189,23 @@ def _manifest_annotations(argv: tuple[str, ...]) -> object:
     annotation = argv[argv.index("--annotation") + 1]
     key, value = annotation.split("=", 1)
     return {key: value}
+
+
+def _failure_code(outcome: OrasOutcome) -> int:
+    if outcome is OrasOutcome.TIMEOUT:
+        return 124
+    return 1
+
+
+def _exported_file(runner: FakeOrasRunner, manifest: bytes) -> bytes | None:
+    if runner.omit_exported_file:
+        return None
+    if runner.exported_file_override is not None:
+        return runner.exported_file_override
+    return manifest
+
+
+def _overwrite_manifest(content: bytes) -> bytes:
+    document = json.loads(content)
+    document["annotations"]["org.opencontainers.image.created"] = "2025-01-01T00:00:00Z"
+    return json.dumps(document, separators=(",", ":"), sort_keys=True).encode()
