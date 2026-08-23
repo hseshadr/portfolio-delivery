@@ -92,7 +92,16 @@ class ReleaseSource:
 
 
 def _has_release_source_identities(release_id: object, revision: object) -> bool:
-    return isinstance(release_id, ReleaseId) and isinstance(revision, SourceRevision)
+    if not isinstance(release_id, ReleaseId) or not isinstance(revision, SourceRevision):
+        return False
+    return _release_matches_revision(release_id, revision)
+
+
+def _release_matches_revision(release_id: ReleaseId, revision: SourceRevision) -> bool:
+    return (
+        release_id.project == revision.project
+        and release_id.source_sha256 == revision.source_tree_sha256
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,12 +189,22 @@ def _validate_signature(signature: Artifact | None, disposition: SigningDisposit
         raise InvalidIdentity("unsigned policy cannot invent a signature artifact")
 
 
+def _validate_canonical_content(canonical_bytes: object, content_sha256: object) -> None:
+    if not isinstance(canonical_bytes, bytes) or not isinstance(content_sha256, Sha256Digest):
+        raise InvalidIdentity("canonical content must use bytes and a digest record")
+    if Sha256Digest.from_bytes(canonical_bytes) != content_sha256:
+        raise InvalidIdentity("canonical content digest must match exact bytes")
+
+
 @dataclass(frozen=True, slots=True)
 class BuildEnvelope:
     signed: SignedBuild
     document: object
     canonical_bytes: bytes
     content_sha256: Sha256Digest
+
+    def __post_init__(self) -> None:
+        _validate_canonical_content(self.canonical_bytes, self.content_sha256)
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,11 +214,26 @@ class QualificationRecord:
     canonical_bytes: bytes
     content_sha256: Sha256Digest
 
+    def __post_init__(self) -> None:
+        _validate_canonical_content(self.canonical_bytes, self.content_sha256)
+
 
 @dataclass(frozen=True, slots=True)
 class QualifiedEnvelope:
     envelope: BuildEnvelope
     qualification: QualificationRecord
+
+    def __post_init__(self) -> None:
+        _validate_qualified_envelope(self.envelope, self.qualification)
+
+
+def _validate_qualified_envelope(envelope: object, qualification: object) -> None:
+    if not isinstance(envelope, BuildEnvelope) or not isinstance(
+        qualification, QualificationRecord
+    ):
+        raise InvalidIdentity("qualified envelope must contain stage records")
+    if qualification.subject != envelope.content_sha256:
+        raise InvalidIdentity("qualification subject must match envelope content digest")
 
 
 @dataclass(frozen=True, slots=True)

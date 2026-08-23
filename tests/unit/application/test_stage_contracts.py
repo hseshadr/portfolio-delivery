@@ -87,22 +87,38 @@ def make_signed_build() -> SignedBuild:
 
 
 def make_envelope_bundle() -> EnvelopeBundle:
-    envelope = BuildEnvelope(make_signed_build(), object(), b"envelope", make_digest("d"))
-    qualification = QualificationRecord(
-        make_digest("d"),
-        object(),
-        b"qualification",
-        make_digest("e"),
-    )
+    envelope = make_build_envelope()
+    qualification = make_qualification_record(envelope)
     return EnvelopeBundle(QualifiedEnvelope(envelope, qualification), (), ())
 
 
-def make_conflicting_bundle(bundle: EnvelopeBundle) -> EnvelopeBundle:
-    qualification = QualificationRecord(
-        make_digest("d"),
+def make_build_envelope() -> BuildEnvelope:
+    canonical_bytes = b"envelope"
+    return BuildEnvelope(
+        make_signed_build(),
         object(),
-        b"different-qualification",
-        make_digest("f"),
+        canonical_bytes,
+        Sha256Digest.from_bytes(canonical_bytes),
+    )
+
+
+def make_qualification_record(envelope: BuildEnvelope) -> QualificationRecord:
+    canonical_bytes = b"qualification"
+    return QualificationRecord(
+        envelope.content_sha256,
+        object(),
+        canonical_bytes,
+        Sha256Digest.from_bytes(canonical_bytes),
+    )
+
+
+def make_conflicting_bundle(bundle: EnvelopeBundle) -> EnvelopeBundle:
+    canonical_bytes = b"different-qualification"
+    qualification = QualificationRecord(
+        bundle.qualified.envelope.content_sha256,
+        object(),
+        canonical_bytes,
+        Sha256Digest.from_bytes(canonical_bytes),
     )
     qualified = QualifiedEnvelope(bundle.qualified.envelope, qualification)
     return EnvelopeBundle(qualified, (), ())
@@ -234,3 +250,89 @@ def test_should_keep_exact_stage_bytes_when_envelope_bundle_is_created() -> None
     # Then
     assert envelope_bytes == b"envelope"
     assert qualification_bytes == b"qualification"
+
+
+@pytest.mark.parametrize(
+    "factory",
+    (
+        lambda: BuildEnvelope(
+            make_signed_build(),
+            object(),
+            cast(bytes, "envelope"),
+            Sha256Digest.from_bytes(b"envelope"),
+        ),
+        lambda: QualificationRecord(
+            make_digest("a"),
+            object(),
+            cast(bytes, "qualification"),
+            Sha256Digest.from_bytes(b"qualification"),
+        ),
+    ),
+)
+def test_should_reject_nonbyte_canonical_content_when_stage_record_is_created(
+    factory: Callable[[], object],
+) -> None:
+    # Given / When / Then
+    with pytest.raises(InvalidIdentity):
+        factory()
+
+
+@pytest.mark.parametrize(
+    "factory",
+    (
+        lambda: BuildEnvelope(make_signed_build(), object(), b"envelope", make_digest("a")),
+        lambda: QualificationRecord(
+            make_digest("a"),
+            object(),
+            b"qualification",
+            make_digest("b"),
+        ),
+    ),
+)
+def test_should_reject_digest_that_does_not_match_canonical_content_when_stage_record_is_created(
+    factory: Callable[[], object],
+) -> None:
+    # Given / When / Then
+    with pytest.raises(InvalidIdentity):
+        factory()
+
+
+@pytest.mark.parametrize(
+    "qualification",
+    (
+        lambda: QualificationRecord(
+            make_digest("f"),
+            object(),
+            b"qualification",
+            Sha256Digest.from_bytes(b"qualification"),
+        ),
+        lambda: cast(QualificationRecord, object()),
+    ),
+)
+def test_should_reject_invalid_qualification_when_envelope_is_qualified(
+    qualification: Callable[[], QualificationRecord],
+) -> None:
+    # Given
+    envelope = make_build_envelope()
+
+    # When / Then
+    with pytest.raises(InvalidIdentity):
+        QualifiedEnvelope(envelope, qualification())
+
+
+@pytest.mark.parametrize(
+    "release_id",
+    (
+        lambda: ReleaseId(ProjectId("other"), "v0.1.0", make_digest("c"), "catalog-v0.1.0"),
+        lambda: ReleaseId(ProjectId("catalog"), "v0.1.0", make_digest("f"), "catalog-v0.1.0"),
+    ),
+)
+def test_should_reject_release_identity_that_disagrees_with_revision_when_release_source_is_created(
+    release_id: Callable[[], ReleaseId],
+) -> None:
+    # Given
+    revision = make_snapshotted_source().release.revision
+
+    # When / Then
+    with pytest.raises(InvalidIdentity):
+        ReleaseSource(release_id(), revision)
