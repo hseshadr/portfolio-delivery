@@ -6,7 +6,11 @@ __pycache__/
 .coverage
 coverage.xml
 htmlcov/
-.dagger/
+.dagger/.venv/
+.dagger/**/__pycache__/
+.dagger/.pytest_cache/
 dist/
 build/
 *.egg-info/
+mutants/
+mutmut-cicd-stats.json
