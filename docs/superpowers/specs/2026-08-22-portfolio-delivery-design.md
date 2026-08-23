@@ -58,9 +58,15 @@ This design makes the release process itself a tested product.
   `7902e644beeba4468f1ea786015b4be1d6d5bbcd`.
 - `dagger/dagger-for-github` `v8.4.1`, pinned to commit
   `27b130bf0f79a7f6fbbbe0fbca6760dc9bb40a77`.
+- Node.js `v24.19.0` LTS for controller and workflow tooling.
+- Wrangler `4.120.0` and `@cloudflare/vitest-pool-workers` `0.20.3`.
+- ORAS `v1.3.3`, pinned as the multi-platform image index
+  `ghcr.io/oras-project/oras@sha256:a4c54befd87d0366e0ba3ac3a9536a5288c8a3735acd3b635cdace59a2c559c8`.
+- `googleapis/release-please-action` `v4`, pinned to commit
+  `5c625bfb5d1ff62eadeeb3772007f7f66fdcf071`.
 - GitHub Actions for events, protected refs, OIDC, queued concurrency,
   attestations, deployments, and status reporting.
-- A pinned ORAS client and GHCR generic OCI artifacts for durable,
+- GHCR generic OCI artifacts for durable,
   content-addressed envelopes.
 - A SQLite-backed Cloudflare Durable Object ledger for cross-repository CAS,
   fencing, recovery, and maturity alarms.
