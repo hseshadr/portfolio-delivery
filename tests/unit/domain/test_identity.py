@@ -1,4 +1,5 @@
 from hashlib import sha256
+from typing import cast
 
 import pytest
 
@@ -71,6 +72,15 @@ def test_should_reject_parent_traversal_when_artifact_path_is_created() -> None:
         ArtifactPath(raw_path)
 
 
+def test_should_reject_nul_byte_when_artifact_path_is_created() -> None:
+    # Given
+    raw_path = "dist/package\x00.whl"
+
+    # When / Then
+    with pytest.raises(InvalidArtifactPath):
+        ArtifactPath(raw_path)
+
+
 @pytest.mark.parametrize(
     "raw_path", ("/dist/package.whl", "dist\\package.whl", "dist//package.whl")
 )
@@ -102,6 +112,21 @@ def test_should_reject_uppercase_commit_sha_when_source_revision_is_created() ->
             repository="hseshadr/edgeproc",
             protected_ref="refs/heads/main",
             commit_sha="A" * 40,
+            source_tree_sha256=source_digest,
+        )
+
+
+def test_should_reject_nonidentity_nested_values_when_source_revision_is_created() -> None:
+    # Given
+    source_digest = Sha256Digest("sha256:" + ("b" * 64))
+
+    # When / Then
+    with pytest.raises(InvalidIdentity):
+        SourceRevision(
+            project=cast(ProjectId, "edgeproc"),
+            repository="hseshadr/edgeproc",
+            protected_ref="refs/heads/main",
+            commit_sha="a" * 40,
             source_tree_sha256=source_digest,
         )
 

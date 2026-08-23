@@ -33,12 +33,17 @@ def _validate_artifact_path(value: str) -> None:
 
 def _is_unsafe_artifact_path(value: str) -> bool:
     invalid_parts = any(part in {"", ".", ".."} for part in value.split("/"))
-    return any((not value, value.startswith("/"), "\\" in value, invalid_parts))
+    return any((not value, value.startswith("/"), "\\" in value, "\x00" in value, invalid_parts))
 
 
 def _validate_commit_sha(value: str) -> None:
     if not isinstance(value, str) or _COMMIT_SHA.fullmatch(value) is None:
         raise InvalidIdentity("commit SHA must be 40 lowercase hexadecimal characters")
+
+
+def _validate_source_identities(project: object, source_digest: object) -> None:
+    if not isinstance(project, ProjectId) or not isinstance(source_digest, Sha256Digest):
+        raise InvalidIdentity("source revision identity fields must use domain identity records")
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +87,7 @@ class SourceRevision:
     source_tree_sha256: Sha256Digest
 
     def __post_init__(self) -> None:
+        _validate_source_identities(self.project, self.source_tree_sha256)
         _require_identity(self.repository)
         _require_identity(self.protected_ref)
         _validate_commit_sha(self.commit_sha)

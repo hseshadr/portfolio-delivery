@@ -17,6 +17,16 @@ def _validate_size(value: int) -> None:
         raise InvalidIdentity("artifact size must be a non-negative integer")
 
 
+def _validate_artifact_identities(path: object, digest: object) -> None:
+    if not isinstance(path, ArtifactPath) or not isinstance(digest, Sha256Digest):
+        raise InvalidIdentity("artifact identity fields must use domain identity records")
+
+
+def _validate_evidence_identities(subject: object, status: object) -> None:
+    if not isinstance(subject, Sha256Digest) or not isinstance(status, EvidenceStatus):
+        raise InvalidIdentity("evidence subject and status must use domain identity records")
+
+
 def ensure_unique_artifact_paths(artifacts: tuple["Artifact", ...]) -> None:
     paths = tuple(artifact.path.value for artifact in artifacts)
     if len(paths) != len(set(paths)):
@@ -32,6 +42,7 @@ class Artifact:
     sha256: Sha256Digest
 
     def __post_init__(self) -> None:
+        _validate_artifact_identities(self.path, self.sha256)
         _require_value(self.name)
         _require_value(self.media_type)
         _validate_size(self.size)
@@ -81,5 +92,6 @@ class Evidence:
     status: EvidenceStatus
 
     def __post_init__(self) -> None:
+        _validate_evidence_identities(self.subject, self.status)
         _require_value(self.kind)
         _require_value(self.name)

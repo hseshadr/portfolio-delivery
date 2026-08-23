@@ -1,3 +1,5 @@
+from typing import cast
+
 import pytest
 
 from portfolio_delivery.domain.artifacts import (
@@ -34,6 +36,21 @@ def test_should_reject_negative_size_when_artifact_is_created() -> None:
     # When / Then
     with pytest.raises(InvalidIdentity):
         Artifact("package", path, "application/zip", -1, make_digest("a"))
+
+
+def test_should_reject_nonidentity_nested_value_when_artifact_is_created() -> None:
+    # Given
+    digest = make_digest("a")
+
+    # When / Then
+    with pytest.raises(InvalidIdentity):
+        Artifact(
+            "package",
+            cast(ArtifactPath, "dist/package.whl"),
+            "application/zip",
+            42,
+            digest,
+        )
 
 
 def test_should_reject_duplicate_paths_when_artifacts_are_checked() -> None:
@@ -96,3 +113,19 @@ def test_should_preserve_check_result_when_evidence_is_created() -> None:
     # Then
     assert evidence.subject is subject
     assert evidence.status is EvidenceStatus.PASSED
+
+
+@pytest.mark.parametrize(
+    ("subject", "status"),
+    (
+        (cast(Sha256Digest, "sha256:" + ("e" * 64)), EvidenceStatus.PASSED),
+        (make_digest("e"), cast(EvidenceStatus, "passed")),
+    ),
+)
+def test_should_reject_invalid_nested_values_when_evidence_is_created(
+    subject: Sha256Digest,
+    status: EvidenceStatus,
+) -> None:
+    # Given / When / Then
+    with pytest.raises(InvalidIdentity):
+        Evidence("test", "unit", subject, status)
