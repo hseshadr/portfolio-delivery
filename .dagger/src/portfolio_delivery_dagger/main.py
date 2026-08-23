@@ -7,8 +7,9 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Final, cast
 
-from dagger import Container, Directory, File, dag, function, object_type
+from dagger import Container, Directory, File, Secret, Service, dag, function, object_type
 
+from portfolio_delivery.adapters.oras import OrasAdapter
 from portfolio_delivery.domain.artifacts import (
     Artifact,
     Evidence,
@@ -26,10 +27,10 @@ from portfolio_delivery.domain.identity import (
     SourceRevision,
 )
 from portfolio_delivery.domain.stages import BuildEnvelope as CoreBuildEnvelope
+from portfolio_delivery.domain.stages import EnvelopeBundle, SigningDisposition
 from portfolio_delivery.domain.stages import PrequalifiedBuild as CorePrequalifiedBuild
 from portfolio_delivery.domain.stages import ReleaseSource as CoreReleaseSource
 from portfolio_delivery.domain.stages import SignedBuild as CoreSignedBuild
-from portfolio_delivery.domain.stages import SigningDisposition
 from portfolio_delivery.domain.stages import SnapshottedSource as CoreSnapshottedSource
 from portfolio_delivery.domain.stages import UnsignedBuild as CoreUnsignedBuild
 from portfolio_delivery.envelope.builder import (
@@ -77,6 +78,16 @@ from portfolio_delivery_dagger.inventory import (
     PrequalificationEvidenceDocument,
     SourceInventoryDocument,
     SourceInventoryEntry,
+)
+from portfolio_delivery_dagger.oras import (
+    DaggerOrasRunner,
+    QualifiedEnvelopeRef,
+    StoredEnvelope,
+    parse_reference,
+    qualified_bundle,
+    restored_dto,
+    stored_dto,
+    validate_release_id,
 )
 from portfolio_delivery_dagger.plan import InputSnapshotPlan
 
@@ -257,6 +268,63 @@ class PortfolioDelivery:
         """Package revalidated qualified bytes and outputs without rebuilding."""
         await _validate_qualified(envelope)
         return _archive(_publish_directory(envelope))
+
+    @function(cache="never")  # type: ignore[call-overload,untyped-decorator]
+    async def persist_oci(
+        self,
+        bundle: QualifiedEnvelope,
+        repository: str,
+        attempt_id: str,
+        registry_config: Secret | None = None,
+        registry_service: Service | None = None,
+    ) -> StoredEnvelope:
+        """Reconcile one exact qualified envelope through pinned ORAS."""
+        core = await qualified_bundle(bundle, _scan_directory)
+        runner = _oras_runner(bundle, core, repository, registry_config, registry_service)
+        stored = await OrasAdapter(runner, repository).persist(core, attempt_id)
+        return stored_dto(stored)
+
+    @function(cache="never")  # type: ignore[call-overload,untyped-decorator]
+    async def restore_qualified(
+        self,
+        release_id: str,
+        envelope_uri: str,
+        envelope_digest: str,
+        registry_config: Secret | None = None,
+        registry_service: Service | None = None,
+    ) -> QualifiedEnvelopeRef:
+        """Restore exact qualified bytes from one manifest-pinned OCI reference."""
+        reference = parse_reference(envelope_uri, envelope_digest)
+        runner = DaggerOrasRunner(
+            dag,
+            reference.repository,
+            registry_config=registry_config,
+            registry_service=registry_service,
+        )
+        bundle = await OrasAdapter(runner, reference.repository).restore(reference, release_id)
+        validate_release_id(bundle, release_id)
+        return restored_dto(runner, release_id, envelope_uri, envelope_digest, bundle)
+
+
+def _oras_runner(
+    dto: QualifiedEnvelope,
+    bundle: EnvelopeBundle,
+    repository: str,
+    registry_config: Secret | None,
+    registry_service: Service | None,
+) -> DaggerOrasRunner:
+    artifacts = tuple(item.path.value for item in bundle.artifacts)
+    sboms = tuple(item.path.value for item in bundle.sboms)
+    return DaggerOrasRunner(
+        dag,
+        repository,
+        dto.artifacts,
+        dto.sboms,
+        artifacts,
+        sboms,
+        registry_config,
+        registry_service,
+    )
 
 
 def _filter(source: Directory, include: list[str], exclude: list[str]) -> Directory:
@@ -767,6 +835,7 @@ def _envelope_dto(build: SignedBuild, envelope: CoreBuildEnvelope) -> BuildEnvel
         input_snapshot_sha256=build.input_snapshot_sha256,
         prequalification_evidence=build.prequalification_evidence,
         prequalification_evidence_sha256=build.prequalification_evidence_sha256,
+        signing_disposition=envelope.signed.disposition.value,
         signature_path=build.signature_path,
         project=build.project,
         version=build.version,
@@ -785,6 +854,7 @@ async def _core_envelope(envelope: BuildEnvelope) -> CoreBuildEnvelope:
     if (
         content != expected.canonical_bytes
         or envelope.envelope_sha256 != expected.content_sha256.value
+        or envelope.signing_disposition != expected.signed.disposition.value
     ):
         raise InvalidIdentity("envelope file, digest, and validated build bytes must agree")
     return expected
@@ -838,6 +908,9 @@ def _qualified_dto(envelope: BuildEnvelope, qualification: File, digest: str) ->
         sboms=envelope.sboms,
         prequalification_evidence=envelope.prequalification_evidence,
         prequalification_evidence_sha256=envelope.prequalification_evidence_sha256,
+        input_snapshot_sha256=envelope.input_snapshot_sha256,
+        signing_disposition=envelope.signing_disposition,
+        signature_path=envelope.signature_path,
     )
 
 

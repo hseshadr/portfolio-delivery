@@ -37,7 +37,10 @@ select = ["E", "F", "I", "W", "C901", "B", "UP", "SIM", "N", "RUF", "ASYNC", "S"
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]
 "tests/dagger/test_module_api.py" = ["S603"]
+"tests/dagger/test_oras_service.py" = ["S603"]
+"tests/dagger/test_secret_boundary.py" = ["S603"]
 ".dagger/src/portfolio_delivery_dagger/dto.py" = ["RUF009"]
+".dagger/src/portfolio_delivery_dagger/oras.py" = ["RUF009"]
 
 [tool.mypy]
 strict = true
@@ -48,6 +51,7 @@ exclude = '^(\.dagger/sdk/|tests/dagger/live_fixture/)'
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = [".", ".dagger/src"]
 
 [tool.coverage.run]
 omit = [".dagger/sdk/*"]

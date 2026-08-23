@@ -1,0 +1,633 @@
+"""Pinned Dagger execution for the pure ORAS reconciliation adapter."""
+
+from __future__ import annotations
+
+import base64
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
+from pathlib import PurePosixPath
+from typing import Final
+
+from dagger import (
+    Client,
+    Container,
+    Directory,
+    File,
+    ReturnType,
+    Secret,
+    Service,
+    field,
+    object_type,
+)
+
+from portfolio_delivery.adapters.oras import (
+    MAX_BLOB_BYTES,
+    MAX_MANIFEST_BYTES,
+    MAX_PROCESS_STDOUT_BYTES,
+    MAX_STDERR_BYTES,
+    MalformedProviderResponse,
+)
+from portfolio_delivery.domain.artifacts import (
+    Artifact,
+    Evidence,
+    EvidenceStatus,
+    LockIdentity,
+    Sbom,
+    ToolchainIdentity,
+)
+from portfolio_delivery.domain.errors import InvalidIdentity
+from portfolio_delivery.domain.identity import (
+    ArtifactPath,
+    ProjectId,
+    ReleaseId,
+    Sha256Digest,
+    SourceRevision,
+)
+from portfolio_delivery.domain.stages import (
+    BuildEnvelope,
+    EnvelopeBundle,
+    OciReference,
+    OrasInvocation,
+    OrasOutcome,
+    OrasResult,
+    PrequalifiedBuild,
+    QualificationRecord,
+    QualifiedEnvelope,
+    ReleaseSource,
+    SignedBuild,
+    SigningDisposition,
+    SnapshottedSource,
+    UnsignedBuild,
+    validate_attempt_id,
+)
+from portfolio_delivery.domain.stages import (
+    StoredEnvelope as CoreStoredEnvelope,
+)
+from portfolio_delivery.envelope.builder import (
+    EnvelopeBuilder,
+    EnvelopeMetadata,
+    PinnedCompatibility,
+    ProjectAdapterVersion,
+    QualificationBuilder,
+    ReleaseChannel,
+    ReleasePolicyMetadata,
+)
+from portfolio_delivery.envelope.canonical import parse_bounded_json
+from portfolio_delivery.envelope.documents import (
+    BuildEnvelopeDocument,
+    EvidenceDocument,
+    LockDocument,
+    QualificationRecordDocument,
+    ToolchainDocument,
+)
+from portfolio_delivery_dagger.dto import QualifiedEnvelope as DaggerQualifiedEnvelope
+from portfolio_delivery_dagger.inventory import FileManifest
+
+ORAS_IMAGE: Final = (
+    "ghcr.io/oras-project/oras@sha256:"
+    "a4c54befd87d0366e0ba3ac3a9536a5288c8a3735acd3b635cdace59a2c559c8"
+)
+REGISTRY_CONFIG_PATH: Final = "/run/secrets/registry-config.json"
+ATTEMPT_ENV: Final = "PORTFOLIO_DELIVERY_ATTEMPT_ID"
+WORKDIR: Final = "/work"
+STDOUT_PATH: Final = "/work/.portfolio-delivery.stdout"
+PROCESS_STDOUT_PATH: Final = "/work/.portfolio-delivery.process-stdout"
+STDERR_PATH: Final = "/work/.portfolio-delivery.stderr"
+MANIFEST_PATH: Final = "/work/manifest.json"
+CORE_INPUT_PATHS: Final = (
+    "config.v1.json",
+    "build-envelope.v1.json",
+    "qualification-record.v1.json",
+)
+NOT_FOUND_MARKERS: Final = (b"manifest unknown", b"manifest_unknown")
+REGISTRY_ERROR_PREFIX: Final = b"error response from registry:"
+TIMEOUT_EXIT_CODE: Final = 124
+type DirectoryScanner = Callable[[Directory], Awaitable[FileManifest]]
+
+
+@dataclass(kw_only=True)
+@object_type
+class StoredEnvelope:
+    """Pinned OCI reference returned after authoritative reconciliation."""
+
+    envelope_uri: str = field()
+    envelope_digest: str = field()
+
+
+@dataclass(kw_only=True)
+@object_type
+class QualifiedEnvelopeRef:
+    """Exact restored public qualification bytes and their published outputs."""
+
+    release_id: str = field()
+    envelope_uri: str = field()
+    envelope_digest: str = field()
+    envelope: File = field()
+    qualification: File = field()
+    artifacts: Directory = field()
+    sboms: Directory = field()
+
+
+@dataclass(slots=True)
+class DaggerOrasRunner:
+    """Run one preplanned ORAS command in the sole reviewed provider image."""
+
+    client: Client
+    repository: str
+    artifacts: Directory | None = None
+    sboms: Directory | None = None
+    artifact_paths: tuple[str, ...] = ()
+    sbom_paths: tuple[str, ...] = ()
+    registry_config: Secret | None = None
+    registry_service: Service | None = None
+    execution_count: int = 0
+    inspection_count: int = 0
+    push_count: int = 0
+    service_started: bool = False
+    fetched_blobs: dict[str, bytes] = dataclass_field(default_factory=dict)
+    previous_container: Container | None = None
+
+    async def run(self, invocation: OrasInvocation, attempt_id: str) -> OrasResult:
+        validate_attempt_id(attempt_id)
+        await self._start_service()
+        self._record(invocation)
+        executed = self._execute(invocation, attempt_id)
+        self.previous_container = executed
+        exit_code = await executed.exit_code()
+        output_path = _provider_output_path(invocation)
+        stdout = await _read_output(executed, output_path, _stdout_limit(invocation))
+        stderr = await _read_output(executed, STDERR_PATH, MAX_STDERR_BYTES)
+        exported = await _exported_manifest(executed, invocation)
+        self._retain_blob(invocation, stdout, exit_code)
+        outcome = _outcome(invocation, exit_code, stderr)
+        return OrasResult(exit_code, outcome, stdout, stderr, exported)
+
+    def _record(self, invocation: OrasInvocation) -> None:
+        self.execution_count += 1
+        if _is_push(invocation.argv):
+            self.push_count += 1
+        else:
+            self.inspection_count += 1
+
+    async def _start_service(self) -> None:
+        if self.registry_service is None or self.service_started:
+            return
+        await self.registry_service.start()
+        self.service_started = True
+
+    def _execute(self, invocation: OrasInvocation, attempt_id: str) -> Container:
+        container = self._configured_container(invocation)
+        argv = _execution_argv(
+            invocation.argv, self.registry_config is not None, self.registry_service is not None
+        )
+        return container.with_env_variable(ATTEMPT_ENV, attempt_id).with_exec(
+            list(argv),
+            redirect_stdout=PROCESS_STDOUT_PATH,
+            redirect_stderr=STDERR_PATH,
+            expect=ReturnType.ANY,
+        )
+
+    def _configured_container(self, invocation: OrasInvocation) -> Container:
+        if self.previous_container is not None:
+            return self._mount_invocation(self.previous_container, invocation)
+        container = self._base_container()
+        return self._mount_invocation(container, invocation)
+
+    def _base_container(self) -> Container:
+        container = self.client.container().from_(ORAS_IMAGE)
+        container = container.with_directory(WORKDIR, self.client.directory())
+        container = container.with_workdir(WORKDIR)
+        container = _mount_secret(container, self.registry_config)
+        return _bind_service(container, self.repository, self.registry_service)
+
+    def _mount_invocation(self, container: Container, invocation: OrasInvocation) -> Container:
+        container = _mount_planned_inputs(container, self.client, invocation)
+        if invocation.input_bytes:
+            return self._mount_payloads(container)
+        return container
+
+    def _mount_payloads(self, container: Container) -> Container:
+        if self.artifacts is not None:
+            container = _mount_directory_files(container, self.artifacts, self.artifact_paths)
+        if self.sboms is not None:
+            container = _mount_directory_files(container, self.sboms, self.sbom_paths)
+        return container
+
+    def _retain_blob(self, invocation: OrasInvocation, content: bytes, code: int) -> None:
+        if invocation.argv[1:3] == ("blob", "fetch") and code == 0:
+            self.fetched_blobs[invocation.argv[-1]] = content
+
+
+def _mount_planned_inputs(
+    container: Container, client: Client, invocation: OrasInvocation
+) -> Container:
+    if not invocation.input_bytes:
+        return container
+    if len(invocation.input_bytes) != len(CORE_INPUT_PATHS):
+        raise InvalidIdentity("ORAS push must carry exactly the three reviewed record inputs")
+    for path, content in zip(CORE_INPUT_PATHS, invocation.input_bytes, strict=True):
+        source = _text_file(client, path, content)
+        container = container.with_mounted_file(f"{WORKDIR}/{path}", source)
+    return container
+
+
+def _text_file(client: Client, path: str, content: bytes) -> File:
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise InvalidIdentity("planned ORAS record input must be canonical UTF-8") from error
+    return client.file(path, text)
+
+
+def _mount_directory_files(
+    container: Container, directory: Directory, paths: tuple[str, ...]
+) -> Container:
+    for path in paths:
+        container = container.with_mounted_file(f"{WORKDIR}/{path}", directory.file(path))
+    return container
+
+
+def _mount_secret(container: Container, secret: Secret | None) -> Container:
+    if secret is None:
+        return container
+    return container.with_mounted_secret(REGISTRY_CONFIG_PATH, secret, owner="0:0", mode=0o400)
+
+
+def _bind_service(container: Container, repository: str, service: Service | None) -> Container:
+    if service is None:
+        return container
+    return container.with_service_binding(_registry_host(repository), service)
+
+
+def _registry_host(repository: str) -> str:
+    authority = repository.split("/", 1)[0]
+    return authority.rsplit(":", 1)[0]
+
+
+def _execution_argv(
+    argv: tuple[str, ...], has_registry_config: bool, has_registry_service: bool
+) -> tuple[str, ...]:
+    authenticated = _authenticated_argv(argv, has_registry_config)
+    authenticated = _output_argv(authenticated)
+    if not has_registry_service:
+        return authenticated
+    return _insert_provider_options(authenticated, ("--plain-http",))
+
+
+def _output_argv(argv: tuple[str, ...]) -> tuple[str, ...]:
+    if argv[1:3] not in {("manifest", "fetch"), ("blob", "fetch")}:
+        return argv
+    return _insert_provider_options(argv, ("--output", STDOUT_PATH))
+
+
+def _authenticated_argv(argv: tuple[str, ...], has_registry_config: bool) -> tuple[str, ...]:
+    if not has_registry_config:
+        return argv
+    return _insert_provider_options(argv, ("--registry-config", REGISTRY_CONFIG_PATH))
+
+
+def _insert_provider_options(argv: tuple[str, ...], options: tuple[str, ...]) -> tuple[str, ...]:
+    index = _reference_index(argv)
+    return (*argv[:index], *options, *argv[index:])
+
+
+def _reference_index(argv: tuple[str, ...]) -> int:
+    if _is_push(argv):
+        return argv.index("manifest.json") + 1
+    return len(argv) - 1
+
+
+def _is_push(argv: tuple[str, ...]) -> bool:
+    return len(argv) > 1 and argv[1] == "push"
+
+
+def _stdout_limit(invocation: OrasInvocation) -> int:
+    command = invocation.argv[1:3]
+    if command == ("manifest", "fetch"):
+        return MAX_MANIFEST_BYTES
+    if command == ("blob", "fetch"):
+        return MAX_BLOB_BYTES
+    return MAX_PROCESS_STDOUT_BYTES
+
+
+def _provider_output_path(invocation: OrasInvocation) -> str:
+    if invocation.argv[1:3] in {("manifest", "fetch"), ("blob", "fetch")}:
+        return STDOUT_PATH
+    return PROCESS_STDOUT_PATH
+
+
+async def _read_output(container: Container, path: str, limit: int) -> bytes:
+    if not await container.exists(path):
+        return b""
+    file = container.file(path)
+    if await file.size() > limit:
+        raise MalformedProviderResponse("ORAS provider output exceeded its response bound")
+    encoded = await container.with_exec(["base64", path]).stdout()
+    try:
+        return base64.b64decode(encoded)
+    except ValueError as error:
+        raise MalformedProviderResponse("ORAS provider output encoding was malformed") from error
+
+
+async def _exported_manifest(container: Container, invocation: OrasInvocation) -> bytes | None:
+    if not _is_push(invocation.argv) or not await container.exists(MANIFEST_PATH):
+        return None
+    return await _read_output(container, MANIFEST_PATH, MAX_MANIFEST_BYTES)
+
+
+def _outcome(invocation: OrasInvocation, code: int, stderr: bytes) -> OrasOutcome:
+    if code == 0:
+        return OrasOutcome.SUCCESS
+    if code == TIMEOUT_EXIT_CODE:
+        return OrasOutcome.TIMEOUT
+    if invocation.argv[1:3] == ("manifest", "fetch") and _is_not_found(stderr):
+        return OrasOutcome.NOT_FOUND
+    return OrasOutcome.FAILURE
+
+
+def _is_not_found(stderr: bytes) -> bool:
+    lowered = stderr.lower()
+    registry_not_found = lowered.startswith(REGISTRY_ERROR_PREFIX) and lowered.rstrip().endswith(
+        b": not found"
+    )
+    return registry_not_found or any(marker in lowered for marker in NOT_FOUND_MARKERS)
+
+
+async def qualified_bundle(
+    bundle: DaggerQualifiedEnvelope, scanner: DirectoryScanner
+) -> EnvelopeBundle:
+    envelope_bytes, qualification_bytes = await _validated_record_bytes(bundle)
+    payload = parse_bounded_json(envelope_bytes, MAX_MANIFEST_BYTES)
+    document = BuildEnvelopeDocument.model_validate(payload)
+    qualification = QualificationRecordDocument.model_validate(
+        parse_bounded_json(qualification_bytes, MAX_MANIFEST_BYTES)
+    )
+    await _validate_output_directories(bundle, document, scanner)
+    return _reconstruct_bundle(bundle, document, qualification, envelope_bytes, qualification_bytes)
+
+
+async def _validated_record_bytes(bundle: DaggerQualifiedEnvelope) -> tuple[bytes, bytes]:
+    envelope = await _bounded_file_bytes(bundle.envelope, MAX_MANIFEST_BYTES)
+    qualification = await _bounded_file_bytes(bundle.qualification, MAX_MANIFEST_BYTES)
+    _require_digest(envelope, bundle.envelope_sha256, "envelope")
+    _require_digest(qualification, bundle.qualification_sha256, "qualification")
+    return envelope, qualification
+
+
+async def _bounded_file_bytes(file: File, limit: int) -> bytes:
+    if await file.size() > limit:
+        raise InvalidIdentity("Dagger record exceeds its configured byte bound")
+    content = (await file.contents()).encode()
+    if len(content) > limit:
+        raise InvalidIdentity("Dagger record exceeds its configured byte bound")
+    return content
+
+
+def _require_digest(content: bytes, digest: str, name: str) -> None:
+    if Sha256Digest.from_bytes(content).value != digest:
+        raise InvalidIdentity(f"{name} bytes must match their retained digest")
+
+
+async def _validate_output_directories(
+    bundle: DaggerQualifiedEnvelope,
+    document: BuildEnvelopeDocument,
+    scanner: DirectoryScanner,
+) -> None:
+    artifacts = await scanner(bundle.artifacts)
+    sboms = await scanner(bundle.sboms)
+    _require_artifact_records(artifacts, document)
+    _require_sbom_records(sboms, document)
+
+
+def _require_artifact_records(manifest: FileManifest, document: BuildEnvelopeDocument) -> None:
+    expected = {item.path: (item.size, item.sha256) for item in document.artifacts}
+    observed = {item.path: (item.size, item.sha256) for item in manifest.files}
+    if observed != expected:
+        raise InvalidIdentity("artifact directory bytes must match the canonical envelope")
+
+
+def _require_sbom_records(manifest: FileManifest, document: BuildEnvelopeDocument) -> None:
+    expected = {item.path: item.sha256 for item in document.sboms}
+    observed = {item.path: item.sha256 for item in manifest.files}
+    if observed != expected:
+        raise InvalidIdentity("SBOM directory bytes must match the canonical envelope")
+
+
+def _reconstruct_bundle(
+    dto: DaggerQualifiedEnvelope,
+    document: BuildEnvelopeDocument,
+    qualification: QualificationRecordDocument,
+    envelope_bytes: bytes,
+    qualification_bytes: bytes,
+) -> EnvelopeBundle:
+    signed = _signed_state(dto, document)
+    envelope = EnvelopeBuilder(_metadata(document)).build(signed)
+    _require_exact_envelope(envelope, envelope_bytes)
+    checks = tuple(_evidence(item) for item in qualification.qualification_evidence)
+    record = QualificationBuilder().build(envelope, checks)
+    _require_exact_qualification(record, qualification_bytes)
+    qualified = QualifiedEnvelope(envelope, record)
+    return EnvelopeBundle(qualified, _artifacts(document), _sboms(document))
+
+
+def _metadata(document: BuildEnvelopeDocument) -> EnvelopeMetadata:
+    policy = document.release_policy
+    compatibility = document.compatibility
+    release_policy = ReleasePolicyMetadata(
+        policy.version, tuple(ReleaseChannel(item) for item in policy.channels)
+    )
+    return EnvelopeMetadata(
+        ProjectAdapterVersion(document.project_adapter_version),
+        document.source_date_epoch,
+        release_policy,
+        PinnedCompatibility(compatibility.dagger, compatibility.oras),
+    )
+
+
+def _signed_state(dto: DaggerQualifiedEnvelope, document: BuildEnvelopeDocument) -> SignedBuild:
+    artifacts = _artifacts(document)
+    signature = _signature(artifacts, dto.signature_path)
+    disposition = SigningDisposition(dto.signing_disposition)
+    _require_signing_coherence(signature, disposition)
+    unsigned = _unsigned_state(dto, document, artifacts, signature)
+    evidence = tuple(_evidence(item) for item in document.prequalification_evidence)
+    return SignedBuild(PrequalifiedBuild(unsigned, evidence), signature, disposition)
+
+
+def _unsigned_state(
+    dto: DaggerQualifiedEnvelope,
+    document: BuildEnvelopeDocument,
+    artifacts: tuple[Artifact, ...],
+    signature: Artifact | None,
+) -> UnsignedBuild:
+    unsigned_artifacts = tuple(item for item in artifacts if item != signature)
+    return UnsignedBuild(
+        _snapshot(document, dto.input_snapshot_sha256),
+        unsigned_artifacts,
+        _sboms(document),
+        tuple(_lock(item) for item in document.locks),
+        tuple(_toolchain(item) for item in document.toolchains),
+    )
+
+
+def _snapshot(document: BuildEnvelopeDocument, input_snapshot: str) -> SnapshottedSource:
+    source = document.source
+    project = ProjectId(source.project)
+    digest = Sha256Digest(source.source_tree_sha256)
+    revision = SourceRevision(
+        project, source.repository, source.protected_ref, source.commit_sha, digest
+    )
+    key = f"{source.project}:{document.release_policy.version}"
+    release_id = ReleaseId(project, document.release_policy.version, digest, key)
+    return SnapshottedSource(ReleaseSource(release_id, revision), Sha256Digest(input_snapshot))
+
+
+def _signature(artifacts: tuple[Artifact, ...], path: str | None) -> Artifact | None:
+    if path is None:
+        return None
+    matches = tuple(item for item in artifacts if item.path.value == path)
+    if len(matches) != 1:
+        raise InvalidIdentity("signature path must identify one canonical artifact")
+    return matches[0]
+
+
+def _require_signing_coherence(signature: Artifact | None, disposition: SigningDisposition) -> None:
+    if (signature is not None) != (disposition is SigningDisposition.SIGNED):
+        raise InvalidIdentity("retained signing disposition must match canonical artifacts")
+
+
+def _require_exact_envelope(envelope: BuildEnvelope, content: bytes) -> None:
+    if envelope.canonical_bytes != content:
+        raise InvalidIdentity("reconstructed domain graph must match canonical envelope bytes")
+
+
+def _require_exact_qualification(record: QualificationRecord, content: bytes) -> None:
+    if record.canonical_bytes != content:
+        message = "reconstructed qualification must match canonical qualification bytes"
+        raise InvalidIdentity(message)
+
+
+def _artifacts(document: BuildEnvelopeDocument) -> tuple[Artifact, ...]:
+    return tuple(
+        Artifact(
+            item.name,
+            ArtifactPath(item.path),
+            item.media_type,
+            item.size,
+            Sha256Digest(item.sha256),
+        )
+        for item in document.artifacts
+    )
+
+
+def _sboms(document: BuildEnvelopeDocument) -> tuple[Sbom, ...]:
+    return tuple(
+        Sbom(
+            ArtifactPath(item.artifact_path),
+            ArtifactPath(item.path),
+            item.media_type,
+            Sha256Digest(item.sha256),
+        )
+        for item in document.sboms
+    )
+
+
+def _lock(document: LockDocument) -> LockIdentity:
+    return LockIdentity(ArtifactPath(document.path), Sha256Digest(document.sha256))
+
+
+def _toolchain(document: ToolchainDocument) -> ToolchainIdentity:
+    return ToolchainIdentity(document.name, document.version, Sha256Digest(document.sha256))
+
+
+def _evidence(document: EvidenceDocument) -> Evidence:
+    return Evidence(
+        document.kind,
+        document.name,
+        Sha256Digest(document.subject),
+        EvidenceStatus(document.status),
+    )
+
+
+def stored_dto(stored: CoreStoredEnvelope) -> StoredEnvelope:
+    reference = stored.reference
+    return StoredEnvelope(
+        envelope_uri=f"{reference.repository}:{reference.tag}",
+        envelope_digest=stored.manifest_sha256.value,
+    )
+
+
+def restored_dto(
+    runner: DaggerOrasRunner,
+    release_id: str,
+    envelope_uri: str,
+    envelope_digest: str,
+    bundle: EnvelopeBundle,
+) -> QualifiedEnvelopeRef:
+    identity = (release_id, envelope_uri, envelope_digest)
+    return _restored_ref(runner, identity, bundle)
+
+
+def _restored_ref(
+    runner: DaggerOrasRunner, identity: tuple[str, str, str], bundle: EnvelopeBundle
+) -> QualifiedEnvelopeRef:
+    release, uri, digest = identity
+    client = runner.client
+    qualified = bundle.qualified
+    return QualifiedEnvelopeRef(
+        release_id=release,
+        envelope_uri=uri,
+        envelope_digest=digest,
+        envelope=_bytes_file(client, "build-envelope.v1.json", qualified.envelope.canonical_bytes),
+        qualification=_bytes_file(
+            client, "qualification-record.v1.json", qualified.qualification.canonical_bytes
+        ),
+        artifacts=_record_directory(client, runner, bundle, artifacts=True),
+        sboms=_record_directory(client, runner, bundle, artifacts=False),
+    )
+
+
+def _record_directory(
+    client: Client, runner: DaggerOrasRunner, bundle: EnvelopeBundle, *, artifacts: bool
+) -> Directory:
+    records = bundle.artifacts if artifacts else bundle.sboms
+    directory = client.directory()
+    for record in records:
+        path = record.path.value
+        content = _restored_content(runner, record.sha256.value)
+        directory = directory.with_file(path, _bytes_file(client, path, content))
+    return directory
+
+
+def _restored_content(runner: DaggerOrasRunner, digest: str) -> bytes:
+    reference = f"{runner.repository}@{digest}"
+    try:
+        return runner.fetched_blobs[reference]
+    except KeyError as error:
+        raise InvalidIdentity("restored provider blob bytes were not retained") from error
+
+
+def _bytes_file(client: Client, name: str, content: bytes) -> File:
+    encoded = base64.b64encode(content).decode()
+    source = client.file(f"{PurePosixPath(name).name}.base64", encoded)
+    return (
+        client.container()
+        .from_(ORAS_IMAGE)
+        .with_mounted_file("/input.base64", source)
+        .with_exec(["base64", "-d", "/input.base64"], redirect_stdout="/output")
+        .file("/output")
+    )
+
+
+def parse_reference(envelope_uri: str, envelope_digest: str) -> OciReference:
+    if ":" not in envelope_uri:
+        raise InvalidIdentity("envelope URI must include an immutable content tag")
+    repository, tag = envelope_uri.rsplit(":", 1)
+    return OciReference(repository, tag, Sha256Digest(envelope_digest))
+
+
+def validate_release_id(bundle: EnvelopeBundle, release_id: str) -> None:
+    actual = bundle.qualified.envelope.signed.prequalified.unsigned.source.release.release_id
+    if actual.idempotency_key != release_id:
+        raise InvalidIdentity("release ID must match restored canonical provenance")

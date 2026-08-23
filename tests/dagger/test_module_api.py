@@ -22,6 +22,10 @@ LIVE_FIXTURE: Final = ROOT / "tests/dagger/live_fixture"
 INTROSPECTION_QUERY: Final = (
     '{ __type(name: "PortfolioDelivery") { fields { name args { name type { name kind } } } } }'
 )
+RETAINED_PROVENANCE_QUERY: Final = (
+    '{ qualified: __type(name: "PortfolioDeliveryQualifiedEnvelope") { fields { name } } '
+    'envelope: __type(name: "PortfolioDeliveryBuildEnvelope") { fields { name } } }'
+)
 DAGGER_CLI: Final = shutil.which("dagger")
 PHASE_ONE_FUNCTIONS: Final = frozenset(
     {
@@ -34,6 +38,8 @@ PHASE_ONE_FUNCTIONS: Final = frozenset(
         "envelope",
         "qualify",
         "publish-inputs",
+        "persist-oci",
+        "restore-qualified",
     }
 )
 
@@ -67,6 +73,18 @@ def run_dagger_functions_json() -> object:
     return json.loads(result.stdout)
 
 
+def run_dagger_query(query: str) -> object:
+    result = subprocess.run(
+        [dagger_cli(), "query", "--silent"],
+        cwd=ROOT,
+        input=query,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
 def root_function_names(result: object) -> set[str]:
     root = cast(dict[str, object], result)["__type"]
     fields = cast(dict[str, object], root)["fields"]
@@ -81,6 +99,19 @@ def snapshot_argument_names(result: object) -> set[str]:
     snapshot = next(item for item in fields if item["name"] == "snapshot")
     arguments = cast(list[dict[str, object]], snapshot["args"])
     return {cast(str, item["name"]) for item in arguments}
+
+
+def root_function(result: object, name: str) -> dict[str, object]:
+    root = cast(dict[str, object], result)["__type"]
+    fields = cast(list[dict[str, object]], cast(dict[str, object], root)["fields"])
+    return next(item for item in fields if item["name"] == name)
+
+
+def argument_type(result: object, function_name: str, argument_name: str) -> dict[str, object]:
+    function = root_function(result, function_name)
+    arguments = cast(list[dict[str, object]], function["args"])
+    argument = next(item for item in arguments if item["name"] == argument_name)
+    return cast(dict[str, object], argument["type"])
 
 
 def snapshot_sha256(source: Path) -> str:
@@ -336,6 +367,33 @@ def test_should_require_typed_release_and_plan_when_snapshot_is_introspected() -
 
     # Then
     assert snapshot_argument_names(result) == {"release", "plan"}
+
+
+def test_should_accept_optional_service_when_restore_is_introspected() -> None:
+    # When
+    result = run_dagger_functions_json()
+
+    # Then
+    service = argument_type(result, "restoreQualified", "registryService")
+    assert service == {"kind": "SCALAR", "name": "ID"}
+
+
+def test_should_retain_exact_oras_provenance_when_qualified_is_introspected() -> None:
+    # When
+    result = cast(dict[str, object], run_dagger_query(RETAINED_PROVENANCE_QUERY))
+    qualified = cast(dict[str, object], result["qualified"])
+    envelope = cast(dict[str, object], result["envelope"])
+
+    # Then
+    qualified_names = _field_names(qualified)
+    envelope_names = _field_names(envelope)
+    assert {"inputSnapshotSha256", "signingDisposition", "signaturePath"} <= qualified_names
+    assert "signingDisposition" in envelope_names
+
+
+def _field_names(type_result: dict[str, object]) -> set[str]:
+    fields = cast(list[dict[str, str]], type_result["fields"])
+    return {item["name"] for item in fields}
 
 
 def test_should_preserve_snapshot_sha256_when_excluded_file_changes(tmp_path: Path) -> None:
