@@ -14,7 +14,7 @@ from portfolio_delivery.domain.artifacts import (
     Sbom,
     ToolchainIdentity,
 )
-from portfolio_delivery.domain.errors import InvalidIdentity
+from portfolio_delivery.domain.errors import InvalidIdentity, diagnostic_error
 from portfolio_delivery.domain.identity import Sha256Digest
 from portfolio_delivery.domain.stages import BuildEnvelope, QualificationRecord, SignedBuild
 from portfolio_delivery.envelope.canonical import canonical_json_bytes
@@ -42,6 +42,48 @@ _PLACEHOLDER_IDENTIFIER: Final = re.compile(
 )
 PINNED_DAGGER_VERSION: Final[str] = "0.21.8"
 PINNED_ORAS_VERSION: Final[str] = "1.3.3"
+_EVIDENCE_RECORDS_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "qualification checks must be evidence records"
+)
+_EVIDENCE_SUBJECT_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "qualification checks must target the final envelope digest"
+)
+_SOURCE_DATE_EPOCH_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "source date epoch must be a positive integer"
+)
+_TYPED_CONTRACT_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "metadata must use declared typed contracts"
+)
+_SEMVER_TEMPLATE = (  # pragma: no mutate - non-contractual diagnostic text
+    "{name} must be canonical semantic version text"
+)
+_PLACEHOLDER_TEMPLATE = (  # pragma: no mutate - non-contractual diagnostic text
+    "{name} cannot contain placeholder identifiers"
+)
+_POLICY_VERSION_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "release policy version must be v-prefixed semantic version"
+)
+_RELEASE_SEMVER_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "release policy version must be canonical semantic version text"
+)
+_RELEASE_PLACEHOLDER_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "release policy version cannot contain placeholder identifiers"
+)
+_CHANNELS_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "release policy must declare channels"
+)
+_CHANNEL_CONTRACT_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "release policy channels must use the declared channel contract"
+)
+_CHANNEL_UNIQUENESS_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "release policy channels must be unique"
+)
+_COMPATIBILITY_TEMPLATE = (  # pragma: no mutate - non-contractual diagnostic text
+    "{name} must match the foundation compatibility pin"
+)
+_RELEASE_VERSION_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "declared release policy must match the release version"
+)
 
 
 class ReleaseChannel(StrEnum):
@@ -214,16 +256,16 @@ def _validate_qualification_checks(envelope: BuildEnvelope, checks: object) -> N
 
 def _require_evidence_checks(checks: object) -> None:
     if not isinstance(checks, tuple):
-        raise InvalidIdentity("qualification checks must be evidence records")
+        raise diagnostic_error(InvalidIdentity, _EVIDENCE_RECORDS_MESSAGE)
     if not all(isinstance(check, Evidence) for check in checks):
-        raise InvalidIdentity("qualification checks must be evidence records")
+        raise diagnostic_error(InvalidIdentity, _EVIDENCE_RECORDS_MESSAGE)
 
 
 def _require_envelope_subjects(envelope: BuildEnvelope, checks: object) -> None:
     if not isinstance(checks, tuple):
-        raise InvalidIdentity("qualification checks must be evidence records")
+        raise diagnostic_error(InvalidIdentity, _EVIDENCE_RECORDS_MESSAGE)
     if any(_is_not_subject(check, envelope.content_sha256) for check in checks):
-        raise InvalidIdentity("qualification checks must target the final envelope digest")
+        raise diagnostic_error(InvalidIdentity, _EVIDENCE_SUBJECT_MESSAGE)
 
 
 def _is_not_subject(check: object, subject: Sha256Digest) -> bool:
@@ -238,25 +280,34 @@ def _validate_metadata_contracts(metadata: EnvelopeMetadata) -> None:
 
 def _validate_source_date_epoch(value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise InvalidIdentity("source date epoch must be a positive integer")
+        raise diagnostic_error(InvalidIdentity, _SOURCE_DATE_EPOCH_MESSAGE)
 
 
 def _require_contract_type(value: object, expected_type: type[object]) -> None:
     if not isinstance(value, expected_type):
-        raise InvalidIdentity("metadata must use declared typed contracts")
+        raise diagnostic_error(InvalidIdentity, _TYPED_CONTRACT_MESSAGE)
 
 
 def _require_semver(value: str, name: str) -> None:
     if not isinstance(value, str) or _SEMVER.fullmatch(value) is None:
-        raise InvalidIdentity(f"{name} must be canonical semantic version text")
+        _diagnostic_message = _SEMVER_TEMPLATE.format(name=name)  # pragma: no mutate - diagnostic
+        raise diagnostic_error(InvalidIdentity, _diagnostic_message)
     if _PLACEHOLDER_IDENTIFIER.search(value) is not None:
-        raise InvalidIdentity(f"{name} cannot contain placeholder identifiers")
+        _diagnostic_message = _PLACEHOLDER_TEMPLATE.format(name=name)  # pragma: no mutate
+        raise diagnostic_error(InvalidIdentity, _diagnostic_message)
 
 
 def _require_release_version(value: str) -> None:
     if not isinstance(value, str) or not value.startswith("v"):
-        raise InvalidIdentity("release policy version must be v-prefixed semantic version")
-    _require_semver(value[1:], "release policy version")
+        raise diagnostic_error(InvalidIdentity, _POLICY_VERSION_MESSAGE)
+    _require_release_semver(value[1:])
+
+
+def _require_release_semver(value: str) -> None:
+    if _SEMVER.fullmatch(value) is None:
+        raise diagnostic_error(InvalidIdentity, _RELEASE_SEMVER_MESSAGE)
+    if _PLACEHOLDER_IDENTIFIER.search(value) is not None:
+        raise diagnostic_error(InvalidIdentity, _RELEASE_PLACEHOLDER_MESSAGE)
 
 
 def _require_release_channels(channels: object) -> None:
@@ -267,31 +318,32 @@ def _require_release_channels(channels: object) -> None:
 
 def _declared_release_channels(channels: object) -> tuple[ReleaseChannel, ...]:
     if not isinstance(channels, tuple):
-        raise InvalidIdentity("release policy must declare channels")
+        raise diagnostic_error(InvalidIdentity, _CHANNELS_MESSAGE)
     if not all(isinstance(channel, ReleaseChannel) for channel in channels):
-        raise InvalidIdentity("release policy channels must use the declared channel contract")
-    return cast(tuple[ReleaseChannel, ...], channels)
+        raise diagnostic_error(InvalidIdentity, _CHANNEL_CONTRACT_MESSAGE)
+    return cast(tuple[ReleaseChannel, ...], channels)  # pragma: no mutate - runtime-neutral cast
 
 
 def _require_nonempty_channels(channels: tuple[ReleaseChannel, ...]) -> None:
     if not channels:
-        raise InvalidIdentity("release policy must declare channels")
+        raise diagnostic_error(InvalidIdentity, _CHANNELS_MESSAGE)
 
 
 def _require_unique_channels(channels: tuple[ReleaseChannel, ...]) -> None:
     if len(channels) != len(set(channels)):
-        raise InvalidIdentity("release policy channels must be unique")
+        raise diagnostic_error(InvalidIdentity, _CHANNEL_UNIQUENESS_MESSAGE)
 
 
 def _require_exact_pin(value: str, expected: str, name: str) -> None:
     if value != expected:
-        raise InvalidIdentity(f"{name} must match the foundation compatibility pin")
+        _diagnostic_message = _COMPATIBILITY_TEMPLATE.format(name=name)  # pragma: no mutate
+        raise diagnostic_error(InvalidIdentity, _diagnostic_message)
 
 
 def _require_policy_matches_release(signed: SignedBuild, metadata: EnvelopeMetadata) -> None:
     version = signed.prequalified.unsigned.source.release.release_id.version
     if metadata.release_policy.version != version:
-        raise InvalidIdentity("declared release policy must match the release version")
+        raise diagnostic_error(InvalidIdentity, _RELEASE_VERSION_MESSAGE)
 
 
 def _release_policy_document(policy: ReleasePolicyMetadata) -> ReleasePolicyDocument:

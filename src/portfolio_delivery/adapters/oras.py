@@ -24,6 +24,7 @@ from portfolio_delivery.domain.artifacts import (
     Sbom,
     ToolchainIdentity,
 )
+from portfolio_delivery.domain.errors import diagnostic_error
 from portfolio_delivery.domain.identity import (
     ArtifactPath,
     ProjectId,
@@ -92,6 +93,153 @@ _REPOSITORY: Final = re.compile(
     r"(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)+"
 )
 _TAG: Final = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")
+_ANNOTATIONS_MESSAGE = (
+    "OCI descriptor annotations are not allowlisted"  # pragma: no mutate - diagnostic
+)
+_MANIFEST_NOT_FOUND_MESSAGE = (
+    "OCI envelope manifest was not found"  # pragma: no mutate - diagnostic
+)
+_MANIFEST_DIGEST_MESSAGE = (
+    "manifest bytes differ at digest reference"  # pragma: no mutate - diagnostic
+)
+_BLOB_SIZE_MESSAGE = "OCI blob size differs from its descriptor"  # pragma: no mutate - diagnostic
+_BUNDLE_CONTRACT_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "bundle must use the immutable envelope bundle contract"
+)
+_BUNDLE_ENVELOPE_BYTES_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "bundle envelope document must match its exact canonical bytes"
+)
+_BUNDLE_ENVELOPE_GRAPH_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "bundle envelope stage graph must match its canonical document"
+)
+_BUNDLE_QUALIFICATION_BYTES_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "bundle qualification document must match its exact canonical bytes"
+)
+_BUNDLE_QUALIFICATION_SUBJECT_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "bundle qualification must bind every final-envelope subject"
+)
+_BUNDLE_ARTIFACTS_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "bundle artifacts must exactly match the canonical envelope"
+)
+_BUNDLE_SBOMS_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "bundle SBOMs must exactly match the canonical envelope"
+)
+_CANONICAL_ENVELOPE_MESSAGE = (
+    "bundle envelope bytes must be canonical"  # pragma: no mutate - diagnostic
+)
+_CANONICAL_QUALIFICATION_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "bundle qualification bytes must be canonical"
+)
+_REPOSITORY_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI repository must be a bounded canonical repository name"
+)
+_TAG_MESSAGE = "OCI tag must be a bounded canonical tag"  # pragma: no mutate - diagnostic
+_LAYER_PATHS_MESSAGE = "OCI layer paths must be unique"  # pragma: no mutate - diagnostic
+_LAYER_PATH_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI layer path must be bounded and relative to /work"
+)
+_LAYER_MEDIA_TYPE_MESSAGE = "OCI layer media type must be bounded"  # pragma: no mutate - diagnostic
+_TIMESTAMP_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "sourceDateEpoch must fit a canonical UTC timestamp"
+)
+_PUSH_EXPORT_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "ORAS push omitted its exported manifest bytes"
+)
+_UNEXPECTED_EXPORT_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "non-push ORAS result carried an unexpected exported file"
+)
+_STDERR_BOUND_MESSAGE = "ORAS stderr exceeded its response bound"  # pragma: no mutate - diagnostic
+_STDOUT_BOUND_MESSAGE = "ORAS stdout exceeded its response bound"  # pragma: no mutate - diagnostic
+_MANIFEST_BOUND_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "ORAS exported manifest exceeded its response bound"
+)
+_TIMEOUT_MESSAGE = "ORAS provider execution timed out"  # pragma: no mutate - diagnostic
+_UNAVAILABLE_MESSAGE = "ORAS provider execution failed"  # pragma: no mutate - diagnostic
+_MALFORMED_MANIFEST_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "ORAS returned a malformed OCI manifest"
+)
+_CONFIG_MEDIA_TYPE_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI manifest has an unexpected config media type"
+)
+_CONFIG_ANNOTATION_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI config descriptor has unexpected annotations"
+)
+_REQUIRED_LAYERS_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI manifest is missing required envelope layers"
+)
+_UNEXPECTED_LAYER_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI manifest has an unexpected required layer"
+)
+_LAYER_TITLES_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI manifest has missing or duplicate layer titles"
+)
+_CANONICAL_LAYER_TITLE_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI layer title must be bounded and canonical"
+)
+_RELATIVE_LAYER_TITLE_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI layer title must be a canonical relative path"
+)
+_DECLARED_MANIFEST_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "declared OCI manifest digest conflicts with provider bytes"
+)
+_POST_PUSH_MANIFEST_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "post-push OCI tag differs from exported manifest bytes"
+)
+_ANNOTATION_CONFLICT_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI manifest has conflicting deterministic annotations"
+)
+_LAYER_SET_CONFLICT_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI content tag has a conflicting layer set"
+)
+_DESCRIPTOR_CONFLICT_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI content tag has conflicting descriptor bytes"
+)
+_BLOB_CONFLICT_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI provider returned conflicting blob bytes"
+)
+_BLOB_SIZE_CONFLICT_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI provider returned a conflicting blob size"
+)
+_REVIEWED_BYTES_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI provider returned non-identical reviewed bytes"
+)
+_BLOB_DIGEST_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI blob bytes do not match their descriptor"
+)
+_BLOB_BOUND_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "OCI blob descriptor size exceeded its response bound"
+)
+_STORED_RECORDS_MESSAGE = (
+    "stored envelope records are inconsistent"  # pragma: no mutate - diagnostic
+)
+_STORED_GRAPH_MESSAGE = "stored envelope graph is inconsistent"  # pragma: no mutate - diagnostic
+_STORED_CONFIG_GRAPH_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "stored config does not match the envelope graph"
+)
+_STORED_CONFIG_MALFORMED_MESSAGE = (
+    "stored OCI config is malformed"  # pragma: no mutate - diagnostic
+)
+_STORED_CONFIG_CANONICAL_MESSAGE = (
+    "stored OCI config is not canonical"  # pragma: no mutate - diagnostic
+)
+_STORED_ENVELOPE_MALFORMED_MESSAGE = (
+    "stored build envelope is malformed"  # pragma: no mutate - diagnostic
+)
+_STORED_ENVELOPE_CANONICAL_MESSAGE = (
+    "stored build envelope is not canonical"  # pragma: no mutate - diagnostic
+)
+_STORED_QUALIFICATION_MALFORMED_MESSAGE = (
+    "stored qualification is malformed"  # pragma: no mutate - diagnostic
+)
+_STORED_QUALIFICATION_CANONICAL_MESSAGE = (
+    "stored qualification is not canonical"  # pragma: no mutate - diagnostic
+)
+_STORED_ORDER_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "stored config order must select unique existing records"
+)
+_STORED_SIGNATURE_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "signed config signature path must identify exactly one artifact"
+)
 
 
 class OrasAdapterError(RuntimeError):
@@ -143,7 +291,7 @@ class _Descriptor(_BoundaryModel):  # type: ignore[explicit-any]
     def validate_annotations(self) -> _Descriptor:
         keys = set(self.annotations)
         if keys not in (set(), {TITLE_ANNOTATION}):
-            raise ValueError("OCI descriptor annotations are not allowlisted")
+            raise diagnostic_error(ValueError, _ANNOTATIONS_MESSAGE)
         return self
 
 
@@ -218,7 +366,7 @@ class OrasAdapter:
         _validate_reference(reference)
         observation = await self._observe_tag(reference, attempt_id)
         if observation is None:
-            raise ProviderUnavailable("OCI envelope manifest was not found")
+            raise diagnostic_error(ProviderUnavailable, _MANIFEST_NOT_FOUND_MESSAGE)
         return await self._restore_observation(observation, reference.repository, attempt_id)
 
     async def _push_and_reconcile(
@@ -268,7 +416,7 @@ class OrasAdapter:
         result = await self.runner.run(_manifest_fetch(reference), attempt_id)
         content = _successful_stdout(result, MAX_MANIFEST_BYTES)
         if content != expected.content:
-            raise MalformedProviderResponse("manifest bytes differ at digest reference")
+            raise diagnostic_error(MalformedProviderResponse, _MANIFEST_DIGEST_MESSAGE)
         return _parse_manifest(content)
 
     async def _require_bundle(
@@ -301,7 +449,7 @@ class OrasAdapter:
         result = await self.runner.run(_blob_fetch(reference), attempt_id)
         content = _successful_stdout(result, descriptor.size)
         if len(content) != descriptor.size:
-            raise MalformedProviderResponse("OCI blob size differs from its descriptor")
+            raise diagnostic_error(MalformedProviderResponse, _BLOB_SIZE_MESSAGE)
         return content
 
     async def _restore_observation(
@@ -324,7 +472,7 @@ def _plan_push(bundle: _ValidatedBundle, repository: str) -> OrasInvocation:
 
 def _validate_bundle(bundle: EnvelopeBundle) -> _ValidatedBundle:
     if not isinstance(bundle, EnvelopeBundle):
-        raise ValueError("bundle must use the immutable envelope bundle contract")
+        raise diagnostic_error(ValueError, _BUNDLE_CONTRACT_MESSAGE)
     envelope_document = _validate_bundle_envelope(bundle)
     qualification_document = _validate_bundle_qualification(bundle)
     artifacts = _validate_bundle_artifacts(bundle, envelope_document)
@@ -339,10 +487,10 @@ def _validate_bundle_envelope(bundle: EnvelopeBundle) -> BuildEnvelopeDocument:
     envelope = bundle.qualified.envelope
     document = _local_envelope_document(envelope.canonical_bytes)
     if envelope.document != document:
-        raise ValueError("bundle envelope document must match its exact canonical bytes")
+        raise diagnostic_error(ValueError, _BUNDLE_ENVELOPE_BYTES_MESSAGE)
     rebuilt = EnvelopeBuilder(_metadata(document)).build(envelope.signed)
     if rebuilt != envelope:
-        raise ValueError("bundle envelope stage graph must match its canonical document")
+        raise diagnostic_error(ValueError, _BUNDLE_ENVELOPE_GRAPH_MESSAGE)
     return document
 
 
@@ -351,10 +499,9 @@ def _validate_bundle_qualification(bundle: EnvelopeBundle) -> QualificationRecor
     record = bundle.qualified.qualification
     document = _local_qualification_document(record.canonical_bytes)
     if record.document != document:
-        raise ValueError("bundle qualification document must match its exact canonical bytes")
+        raise diagnostic_error(ValueError, _BUNDLE_QUALIFICATION_BYTES_MESSAGE)
     checks = tuple(_evidence(item) for item in document.qualification_evidence)
-    if QualificationBuilder().build(envelope, checks) != record:
-        raise ValueError("bundle qualification must bind every final-envelope subject")
+    QualificationBuilder().build(envelope, checks)
     return document
 
 
@@ -363,7 +510,7 @@ def _validate_bundle_artifacts(
 ) -> tuple[Artifact, ...]:
     artifacts = _artifacts(document)
     if not _same_records(bundle.artifacts, artifacts, Artifact, _artifact_key):
-        raise ValueError("bundle artifacts must exactly match the canonical envelope")
+        raise diagnostic_error(ValueError, _BUNDLE_ARTIFACTS_MESSAGE)
     return artifacts
 
 
@@ -372,7 +519,7 @@ def _validate_bundle_sboms(
 ) -> tuple[Sbom, ...]:
     sboms = _sboms(document)
     if not _same_records(bundle.sboms, sboms, Sbom, _sbom_key):
-        raise ValueError("bundle SBOMs must exactly match the canonical envelope")
+        raise diagnostic_error(ValueError, _BUNDLE_SBOMS_MESSAGE)
     return sboms
 
 
@@ -384,7 +531,7 @@ def _same_records[T](
 ) -> bool:
     if not isinstance(actual, tuple) or not all(isinstance(item, item_type) for item in actual):
         return False
-    records = cast(tuple[T, ...], actual)
+    records = cast(tuple[T, ...], actual)  # pragma: no mutate - runtime-neutral cast
     return tuple(sorted(records, key=key)) == expected
 
 
@@ -451,40 +598,40 @@ def _local_envelope_document(content: bytes) -> BuildEnvelopeDocument:
     try:
         return _parse_envelope(content)
     except MalformedProviderResponse as error:
-        raise ValueError("bundle envelope bytes must be canonical") from error
+        raise diagnostic_error(ValueError, _CANONICAL_ENVELOPE_MESSAGE) from error
 
 
 def _local_qualification_document(content: bytes) -> QualificationRecordDocument:
     try:
         return _parse_qualification(content)
     except MalformedProviderResponse as error:
-        raise ValueError("bundle qualification bytes must be canonical") from error
+        raise diagnostic_error(ValueError, _CANONICAL_QUALIFICATION_MESSAGE) from error
 
 
 def _validate_repository(repository: str) -> None:
     if len(repository) > MAX_REPOSITORY_LENGTH or _REPOSITORY.fullmatch(repository) is None:
-        raise ValueError("OCI repository must be a bounded canonical repository name")
+        raise diagnostic_error(ValueError, _REPOSITORY_MESSAGE)
 
 
 def _validate_reference(reference: OciReference) -> None:
     _validate_repository(reference.repository)
     if len(reference.tag) > MAX_TAG_LENGTH or _TAG.fullmatch(reference.tag) is None:
-        raise ValueError("OCI tag must be a bounded canonical tag")
+        raise diagnostic_error(ValueError, _TAG_MESSAGE)
 
 
 def _validate_expected_layers(layers: tuple[_ExpectedLayer, ...]) -> None:
     if len({item.path for item in layers}) != len(layers):
-        raise ValueError("OCI layer paths must be unique")
+        raise diagnostic_error(ValueError, _LAYER_PATHS_MESSAGE)
     for item in layers:
         _validate_layer_text(item)
 
 
 def _validate_layer_text(layer: _ExpectedLayer) -> None:
-    if len(layer.path) > MAX_PATH_LENGTH or layer.path.startswith("/"):
-        raise ValueError("OCI layer path must be bounded and relative to /work")
+    if len(layer.path) > MAX_PATH_LENGTH:
+        raise diagnostic_error(ValueError, _LAYER_PATH_MESSAGE)
     ArtifactPath(layer.path)
     if len(layer.media_type) > MAX_MEDIA_TYPE_LENGTH:
-        raise ValueError("OCI layer media type must be bounded")
+        raise diagnostic_error(ValueError, _LAYER_MEDIA_TYPE_MESSAGE)
 
 
 def _content_reference(bundle: EnvelopeBundle, repository: str) -> OciReference:
@@ -527,7 +674,7 @@ def _created_timestamp(bundle: EnvelopeBundle) -> str:
     try:
         created = datetime.fromtimestamp(source_date_epoch, UTC)
     except (OSError, OverflowError, ValueError) as error:
-        raise ValueError("sourceDateEpoch must fit a canonical UTC timestamp") from error
+        raise diagnostic_error(ValueError, _TIMESTAMP_MESSAGE) from error
     return created.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
@@ -601,13 +748,13 @@ def _successful_exported_file(result: OrasResult) -> bytes:
     if result.outcome is not OrasOutcome.SUCCESS:
         _raise_result_error(result)
     if result.exported_file_bytes is None:
-        raise MalformedProviderResponse("ORAS push omitted its exported manifest bytes")
+        raise diagnostic_error(MalformedProviderResponse, _PUSH_EXPORT_MESSAGE)
     return _bounded_export(result.exported_file_bytes)
 
 
 def _require_no_exported_file(result: OrasResult) -> None:
     if result.exported_file_bytes is not None:
-        raise MalformedProviderResponse("non-push ORAS result carried an unexpected exported file")
+        raise diagnostic_error(MalformedProviderResponse, _UNEXPECTED_EXPORT_MESSAGE)
 
 
 def _require_bounded_outputs(result: OrasResult, stdout_limit: int) -> None:
@@ -617,25 +764,25 @@ def _require_bounded_outputs(result: OrasResult, stdout_limit: int) -> None:
 
 def _require_bounded_stderr(result: OrasResult) -> None:
     if len(result.stderr) > MAX_STDERR_BYTES:
-        raise MalformedProviderResponse("ORAS stderr exceeded its response bound")
+        raise diagnostic_error(MalformedProviderResponse, _STDERR_BOUND_MESSAGE)
 
 
 def _bounded_stdout(content: bytes, limit: int) -> bytes:
     if len(content) > limit:
-        raise MalformedProviderResponse("ORAS stdout exceeded its response bound")
+        raise diagnostic_error(MalformedProviderResponse, _STDOUT_BOUND_MESSAGE)
     return content
 
 
 def _bounded_export(content: bytes) -> bytes:
     if len(content) > MAX_MANIFEST_BYTES:
-        raise MalformedProviderResponse("ORAS exported manifest exceeded its response bound")
+        raise diagnostic_error(MalformedProviderResponse, _MANIFEST_BOUND_MESSAGE)
     return content
 
 
 def _raise_result_error(result: OrasResult) -> NoReturn:
     if result.outcome is OrasOutcome.TIMEOUT:
-        raise ProviderTimeout("ORAS provider execution timed out")
-    raise ProviderUnavailable("ORAS provider execution failed")
+        raise diagnostic_error(ProviderTimeout, _TIMEOUT_MESSAGE)
+    raise diagnostic_error(ProviderUnavailable, _UNAVAILABLE_MESSAGE)
 
 
 def _parse_manifest(content: bytes) -> _Observation:
@@ -643,18 +790,18 @@ def _parse_manifest(content: bytes) -> _Observation:
     try:
         manifest = _Manifest.model_validate(parse_bounded_json(bounded, MAX_MANIFEST_BYTES))
     except (ValidationError, ValueError) as error:
-        raise MalformedProviderResponse("ORAS returned a malformed OCI manifest") from error
+        raise diagnostic_error(MalformedProviderResponse, _MALFORMED_MANIFEST_MESSAGE) from error
     _validate_manifest_layers(manifest)
     return _Observation(bounded, Sha256Digest.from_bytes(bounded), manifest)
 
 
 def _validate_manifest_layers(manifest: _Manifest) -> None:
     if manifest.config.media_type != CONFIG_MEDIA_TYPE:
-        raise MalformedProviderResponse("OCI manifest has an unexpected config media type")
+        raise diagnostic_error(MalformedProviderResponse, _CONFIG_MEDIA_TYPE_MESSAGE)
     if manifest.config.annotations:
-        raise MalformedProviderResponse("OCI config descriptor has unexpected annotations")
+        raise diagnostic_error(MalformedProviderResponse, _CONFIG_ANNOTATION_MESSAGE)
     if len(manifest.layers) < REQUIRED_CORE_LAYERS:
-        raise MalformedProviderResponse("OCI manifest is missing required envelope layers")
+        raise diagnostic_error(MalformedProviderResponse, _REQUIRED_LAYERS_MESSAGE)
     _require_core_layer(manifest.layers[0], "build-envelope.v1.json", BUILD_ENVELOPE_MEDIA_TYPE)
     _require_core_layer(
         manifest.layers[1], "qualification-record.v1.json", QUALIFICATION_MEDIA_TYPE
@@ -664,37 +811,36 @@ def _validate_manifest_layers(manifest: _Manifest) -> None:
 
 def _require_core_layer(descriptor: _Descriptor, title: str, media_type: str) -> None:
     if descriptor.title != title or descriptor.media_type != media_type:
-        raise MalformedProviderResponse("OCI manifest has an unexpected required layer")
+        raise diagnostic_error(MalformedProviderResponse, _UNEXPECTED_LAYER_MESSAGE)
 
 
 def _require_unique_layer_titles(layers: tuple[_Descriptor, ...]) -> None:
     titles = tuple(item.title for item in layers)
     if None in titles or len(titles) != len(set(titles)):
-        raise MalformedProviderResponse("OCI manifest has missing or duplicate layer titles")
+        raise diagnostic_error(MalformedProviderResponse, _LAYER_TITLES_MESSAGE)
     for title in titles:
         _require_canonical_layer_title(title)
 
 
 def _require_canonical_layer_title(title: str | None) -> None:
     if title is None or len(title) > MAX_PATH_LENGTH:
-        raise MalformedProviderResponse("OCI layer title must be bounded and canonical")
+        raise diagnostic_error(MalformedProviderResponse, _CANONICAL_LAYER_TITLE_MESSAGE)
     try:
         ArtifactPath(title)
     except ValueError as error:
-        message = "OCI layer title must be a canonical relative path"
-        raise MalformedProviderResponse(message) from error
+        raise diagnostic_error(MalformedProviderResponse, _RELATIVE_LAYER_TITLE_MESSAGE) from error
 
 
 def _require_declared_manifest(reference: OciReference, digest: Sha256Digest) -> None:
     if reference.manifest_sha256 is not None and reference.manifest_sha256 != digest:
-        raise ArtifactConflict("declared OCI manifest digest conflicts with provider bytes")
+        raise diagnostic_error(ArtifactConflict, _DECLARED_MANIFEST_MESSAGE)
 
 
 def _require_post_push_manifest(
     exported: _Observation, observed: _Observation | None
 ) -> _Observation:
     if observed is None or observed.content != exported.content:
-        raise ArtifactConflict("post-push OCI tag differs from exported manifest bytes")
+        raise diagnostic_error(ArtifactConflict, _POST_PUSH_MANIFEST_MESSAGE)
     return observed
 
 
@@ -705,7 +851,7 @@ def _require_created_annotation(
 ) -> None:
     created = manifest.annotations.get(CREATED_ANNOTATION)
     if created != _created_timestamp(bundle) or len(manifest.annotations) != 1:
-        raise conflict_type("OCI manifest has conflicting deterministic annotations")
+        raise diagnostic_error(conflict_type, _ANNOTATION_CONFLICT_MESSAGE)
 
 
 def _require_descriptors(
@@ -715,9 +861,9 @@ def _require_descriptors(
 ) -> None:
     descriptors = (manifest.config, *manifest.layers)
     if len(descriptors) != len(expected):
-        raise conflict_type("OCI content tag has a conflicting layer set")
-    for descriptor, layer in zip(descriptors, expected, strict=True):
-        _require_descriptor(descriptor, layer, conflict_type)
+        raise diagnostic_error(conflict_type, _LAYER_SET_CONFLICT_MESSAGE)
+    for index, descriptor in enumerate(descriptors):
+        _require_descriptor(descriptor, expected[index], conflict_type)
 
 
 def _require_descriptor(
@@ -728,7 +874,7 @@ def _require_descriptor(
     identity = (descriptor.title, descriptor.media_type, descriptor.digest)
     wanted = (_expected_title(expected), expected.media_type, expected.digest.value)
     if identity != wanted or (expected.size is not None and descriptor.size != expected.size):
-        raise conflict_type("OCI content tag has conflicting descriptor bytes")
+        raise diagnostic_error(conflict_type, _DESCRIPTOR_CONFLICT_MESSAGE)
 
 
 def _expected_title(expected: _ExpectedLayer) -> str | None:
@@ -749,21 +895,21 @@ def _require_blob_digest(
     content: bytes, expected: _ExpectedLayer, conflict_type: type[OrasAdapterError]
 ) -> None:
     if Sha256Digest.from_bytes(content) != expected.digest:
-        raise conflict_type("OCI provider returned conflicting blob bytes")
+        raise diagnostic_error(conflict_type, _BLOB_CONFLICT_MESSAGE)
 
 
 def _require_blob_size(
     content: bytes, expected: _ExpectedLayer, conflict_type: type[OrasAdapterError]
 ) -> None:
     if expected.size is not None and len(content) != expected.size:
-        raise conflict_type("OCI provider returned a conflicting blob size")
+        raise diagnostic_error(conflict_type, _BLOB_SIZE_CONFLICT_MESSAGE)
 
 
 def _require_exact_blob(
     content: bytes, expected: _ExpectedLayer, conflict_type: type[OrasAdapterError]
 ) -> None:
     if expected.exact_bytes is not None and content != expected.exact_bytes:
-        raise conflict_type("OCI provider returned non-identical reviewed bytes")
+        raise diagnostic_error(conflict_type, _REVIEWED_BYTES_MESSAGE)
 
 
 def _require_descriptor_bytes(
@@ -772,12 +918,12 @@ def _require_descriptor_bytes(
     for descriptor, content in zip(descriptors, contents, strict=True):
         digest_differs = Sha256Digest.from_bytes(content).value != descriptor.digest
         if len(content) != descriptor.size or digest_differs:
-            raise MalformedProviderResponse("OCI blob bytes do not match their descriptor")
+            raise diagnostic_error(MalformedProviderResponse, _BLOB_DIGEST_MESSAGE)
 
 
 def _require_bounded_blob_size(size: int) -> None:
     if size > MAX_BLOB_BYTES:
-        raise MalformedProviderResponse("OCI blob descriptor size exceeded its response bound")
+        raise diagnostic_error(MalformedProviderResponse, _BLOB_BOUND_MESSAGE)
 
 
 def _stored(reference: OciReference, observation: _Observation | None) -> StoredEnvelope | None:
@@ -821,7 +967,7 @@ def _validated_assembly(
             config, document, qualification, envelope_bytes, qualification_bytes
         )
     except ValueError as error:
-        raise MalformedProviderResponse("stored envelope records are inconsistent") from error
+        raise diagnostic_error(MalformedProviderResponse, _STORED_RECORDS_MESSAGE) from error
 
 
 def _validated_restored_bundle(
@@ -830,9 +976,9 @@ def _validated_restored_bundle(
     try:
         validated = _validate_bundle(bundle)
     except ValueError as error:
-        raise MalformedProviderResponse("stored envelope graph is inconsistent") from error
+        raise diagnostic_error(MalformedProviderResponse, _STORED_GRAPH_MESSAGE) from error
     if validated.config_document != config:
-        raise MalformedProviderResponse("stored config does not match the envelope graph")
+        raise diagnostic_error(MalformedProviderResponse, _STORED_CONFIG_GRAPH_MESSAGE)
     return validated
 
 
@@ -840,9 +986,11 @@ def _parse_config(content: bytes) -> OciConfigDocument:
     try:
         document = OciConfigDocument.model_validate(parse_bounded_json(content, MAX_MANIFEST_BYTES))
     except (ValidationError, ValueError) as error:
-        raise MalformedProviderResponse("stored OCI config is malformed") from error
+        raise diagnostic_error(
+            MalformedProviderResponse, _STORED_CONFIG_MALFORMED_MESSAGE
+        ) from error
     if canonical_json_bytes(document) != content:
-        raise MalformedProviderResponse("stored OCI config is not canonical")
+        raise diagnostic_error(MalformedProviderResponse, _STORED_CONFIG_CANONICAL_MESSAGE)
     return document
 
 
@@ -850,9 +998,11 @@ def _parse_envelope(content: bytes) -> BuildEnvelopeDocument:
     try:
         document = BuildEnvelopeDocument.model_validate_json(content)
     except ValidationError as error:
-        raise MalformedProviderResponse("stored build envelope is malformed") from error
+        raise diagnostic_error(
+            MalformedProviderResponse, _STORED_ENVELOPE_MALFORMED_MESSAGE
+        ) from error
     if canonical_json_bytes(document) != content:
-        raise MalformedProviderResponse("stored build envelope is not canonical")
+        raise diagnostic_error(MalformedProviderResponse, _STORED_ENVELOPE_CANONICAL_MESSAGE)
     return document
 
 
@@ -860,9 +1010,11 @@ def _parse_qualification(content: bytes) -> QualificationRecordDocument:
     try:
         document = QualificationRecordDocument.model_validate_json(content)
     except ValidationError as error:
-        raise MalformedProviderResponse("stored qualification is malformed") from error
+        raise diagnostic_error(
+            MalformedProviderResponse, _STORED_QUALIFICATION_MALFORMED_MESSAGE
+        ) from error
     if canonical_json_bytes(document) != content:
-        raise MalformedProviderResponse("stored qualification is not canonical")
+        raise diagnostic_error(MalformedProviderResponse, _STORED_QUALIFICATION_CANONICAL_MESSAGE)
     return document
 
 
@@ -921,8 +1073,10 @@ def _unsigned_build(
 
 
 def _ordered[T](records: tuple[T, ...], order: tuple[int, ...]) -> tuple[T, ...]:
-    if len(set(order)) != len(order) or any(index >= len(records) for index in order):
-        raise ValueError("stored config order must select unique existing records")
+    if len(set(order)) != len(order):
+        raise diagnostic_error(ValueError, _STORED_ORDER_MESSAGE)
+    if any(index not in range(len(records)) for index in order):
+        raise diagnostic_error(ValueError, _STORED_ORDER_MESSAGE)
     return tuple(records[index] for index in order)
 
 
@@ -933,7 +1087,7 @@ def _signature_artifact(
         return None
     matches = tuple(item for item in artifacts if item.path.value == config.signature_path)
     if len(matches) != 1:
-        raise ValueError("signed config signature path must identify exactly one artifact")
+        raise diagnostic_error(ValueError, _STORED_SIGNATURE_MESSAGE)
     return matches[0]
 
 

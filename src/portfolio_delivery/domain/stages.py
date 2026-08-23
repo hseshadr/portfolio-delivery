@@ -12,22 +12,77 @@ from portfolio_delivery.domain.artifacts import (
     Sbom,
     ToolchainIdentity,
 )
-from portfolio_delivery.domain.errors import InvalidIdentity
+from portfolio_delivery.domain.errors import InvalidIdentity, diagnostic_error
 from portfolio_delivery.domain.identity import ReleaseId, Sha256Digest, SourceRevision
+
+_ATTEMPT_ID_MESSAGE = "attempt ID must be non-empty and canonical"  # pragma: no mutate
+_INCLUDED_PATHS_MESSAGE = "included paths must be a tuple of strings"  # pragma: no mutate
+_EXCLUDED_PATHS_MESSAGE = "excluded paths must be a tuple of strings"  # pragma: no mutate
+_INPUTS_MESSAGE = "inputs must be lock identity records"  # pragma: no mutate
+_BUILD_PLAN_NAME_MESSAGE = "build plan name must be non-empty and canonical"  # pragma: no mutate
+_BUILD_COMMANDS_MESSAGE = "build commands must be a tuple of strings"  # pragma: no mutate
+_SIGNING_KEY_MESSAGE = "signing key ID must be non-empty and canonical"  # pragma: no mutate
+_VERIFICATION_CHECKS_MESSAGE = (  # pragma: no mutate
+    "verification checks must be a tuple of strings"
+)
+_RELEASE_SOURCE_MESSAGE = (  # pragma: no mutate
+    "release source must use release and source identity records"
+)
+_SNAPSHOT_SOURCE_MESSAGE = "snapshot source must use domain identity records"  # pragma: no mutate
+_UNSIGNED_SOURCE_MESSAGE = "unsigned build source must be a snapshotted source"  # pragma: no mutate
+_BUILD_ARTIFACTS_MESSAGE = "build artifacts must be artifact records"  # pragma: no mutate
+_BUILD_SBOMS_MESSAGE = "build SBOMs must be SBOM records"  # pragma: no mutate
+_BUILD_LOCKS_MESSAGE = "build locks must be lock identity records"  # pragma: no mutate
+_BUILD_TOOLCHAINS_MESSAGE = "build toolchains must be toolchain records"  # pragma: no mutate
+_PREQUALIFIED_BUILD_MESSAGE = (
+    "prequalified build must contain an unsigned build"  # pragma: no mutate
+)
+_PREQUALIFICATION_EVIDENCE_MESSAGE = (  # pragma: no mutate
+    "prequalification evidence must be evidence records"
+)
+_SIGNED_BUILD_MESSAGE = "signed build must contain a prequalified build"  # pragma: no mutate
+_SIGNING_DISPOSITION_MESSAGE = "signed build disposition must be explicit"  # pragma: no mutate
+_SIGNATURE_REQUIRED_MESSAGE = "signed builds require a signature artifact"  # pragma: no mutate
+_SIGNATURE_FORBIDDEN_MESSAGE = (
+    "unsigned policy cannot invent a signature artifact"  # pragma: no mutate
+)
+_CANONICAL_CONTENT_MESSAGE = (
+    "canonical content must use bytes and a digest record"  # pragma: no mutate
+)
+_CONTENT_DIGEST_MESSAGE = "canonical content digest must match exact bytes"  # pragma: no mutate
+_QUALIFIED_ENVELOPE_MESSAGE = "qualified envelope must contain stage records"  # pragma: no mutate
+_QUALIFICATION_SUBJECT_MESSAGE = (  # pragma: no mutate
+    "qualification subject must match envelope content digest"
+)
+_OCI_REPOSITORY_MESSAGE = "OCI repository must be non-empty and canonical"  # pragma: no mutate
+_OCI_TAG_MESSAGE = "OCI tag must be non-empty and canonical"  # pragma: no mutate
+_OCI_MANIFEST_MESSAGE = "OCI manifest must be a digest record"  # pragma: no mutate
+_ORAS_ARGUMENTS_MESSAGE = "ORAS arguments must be a tuple of strings"  # pragma: no mutate
+_ORAS_INPUTS_MESSAGE = "ORAS inputs must be a tuple of bytes"  # pragma: no mutate
+_ORAS_EXIT_CODE_MESSAGE = "ORAS exit code must be an integer"  # pragma: no mutate
+_ORAS_OUTCOME_MESSAGE = (
+    "ORAS outcome must use the typed provider classification"  # pragma: no mutate
+)
+_ORAS_OUTPUT_MESSAGE = "ORAS process output must be exact bytes"  # pragma: no mutate
+_ORAS_COHERENCE_MESSAGE = "ORAS outcome must agree with its exit code"  # pragma: no mutate
+_ORAS_EXPORT_MESSAGE = "ORAS exported file payload must be exact bytes"  # pragma: no mutate
+_ORAS_FAILED_EXPORT_MESSAGE = (  # pragma: no mutate
+    "failed ORAS executions cannot export authoritative file bytes"
+)
 
 
 def _require_text(value: str, message: str) -> None:
     if not isinstance(value, str) or not value or value != value.strip():
-        raise InvalidIdentity(message)
+        raise diagnostic_error(InvalidIdentity, message)
 
 
 def _require_tuple(value: object, item_type: type[object], message: str) -> None:
     if not isinstance(value, tuple) or not all(isinstance(item, item_type) for item in value):
-        raise InvalidIdentity(message)
+        raise diagnostic_error(InvalidIdentity, message)
 
 
 def _require_attempt_id(attempt_id: str) -> None:
-    _require_text(attempt_id, "attempt ID must be non-empty and canonical")
+    _require_text(attempt_id, _ATTEMPT_ID_MESSAGE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,9 +92,9 @@ class InputSnapshotPlan:
     inputs: tuple[LockIdentity, ...] = ()
 
     def __post_init__(self) -> None:
-        _require_tuple(self.include_paths, str, "included paths must be a tuple of strings")
-        _require_tuple(self.exclude_paths, str, "excluded paths must be a tuple of strings")
-        _require_tuple(self.inputs, LockIdentity, "inputs must be lock identity records")
+        _require_tuple(self.include_paths, str, _INCLUDED_PATHS_MESSAGE)
+        _require_tuple(self.exclude_paths, str, _EXCLUDED_PATHS_MESSAGE)
+        _require_tuple(self.inputs, LockIdentity, _INPUTS_MESSAGE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,8 +103,8 @@ class BuildPlan:
     commands: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        _require_text(self.name, "build plan name must be non-empty and canonical")
-        _require_tuple(self.commands, str, "build commands must be a tuple of strings")
+        _require_text(self.name, _BUILD_PLAN_NAME_MESSAGE)
+        _require_tuple(self.commands, str, _BUILD_COMMANDS_MESSAGE)
 
 
 class SigningDisposition(StrEnum):
@@ -65,7 +120,7 @@ class SigningPolicy:
 
     @classmethod
     def required(cls, key_id: str) -> SigningPolicy:
-        _require_text(key_id, "signing key ID must be non-empty and canonical")
+        _require_text(key_id, _SIGNING_KEY_MESSAGE)
         return cls(key_id)
 
     @classmethod
@@ -78,7 +133,7 @@ class VerificationPlan:
     checks: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        _require_tuple(self.checks, str, "verification checks must be a tuple of strings")
+        _require_tuple(self.checks, str, _VERIFICATION_CHECKS_MESSAGE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +143,7 @@ class ReleaseSource:
 
     def __post_init__(self) -> None:
         if not _has_release_source_identities(self.release_id, self.revision):
-            raise InvalidIdentity("release source must use release and source identity records")
+            raise diagnostic_error(InvalidIdentity, _RELEASE_SOURCE_MESSAGE)
 
 
 def _has_release_source_identities(release_id: object, revision: object) -> bool:
@@ -113,7 +168,7 @@ class SnapshottedSource:
         if not isinstance(self.release, ReleaseSource) or not isinstance(
             self.input_snapshot_sha256, Sha256Digest
         ):
-            raise InvalidIdentity("snapshot source must use domain identity records")
+            raise diagnostic_error(InvalidIdentity, _SNAPSHOT_SOURCE_MESSAGE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,14 +185,14 @@ class UnsignedBuild:
 
 def _validate_unsigned_build(build: UnsignedBuild) -> None:
     if not isinstance(build.source, SnapshottedSource):
-        raise InvalidIdentity("unsigned build source must be a snapshotted source")
-    _require_tuple(build.artifacts, Artifact, "build artifacts must be artifact records")
-    _require_tuple(build.sboms, Sbom, "build SBOMs must be SBOM records")
-    _require_tuple(build.locks, LockIdentity, "build locks must be lock identity records")
+        raise diagnostic_error(InvalidIdentity, _UNSIGNED_SOURCE_MESSAGE)
+    _require_tuple(build.artifacts, Artifact, _BUILD_ARTIFACTS_MESSAGE)
+    _require_tuple(build.sboms, Sbom, _BUILD_SBOMS_MESSAGE)
+    _require_tuple(build.locks, LockIdentity, _BUILD_LOCKS_MESSAGE)
     _require_tuple(
         build.toolchains,
         ToolchainIdentity,
-        "build toolchains must be toolchain records",
+        _BUILD_TOOLCHAINS_MESSAGE,
     )
 
 
@@ -148,11 +203,11 @@ class PrequalifiedBuild:
 
     def __post_init__(self) -> None:
         if not isinstance(self.unsigned, UnsignedBuild):
-            raise InvalidIdentity("prequalified build must contain an unsigned build")
+            raise diagnostic_error(InvalidIdentity, _PREQUALIFIED_BUILD_MESSAGE)
         _require_tuple(
             self.evidence,
             Evidence,
-            "prequalification evidence must be evidence records",
+            _PREQUALIFICATION_EVIDENCE_MESSAGE,
         )
 
 
@@ -174,26 +229,26 @@ def _validate_signed_build(build: SignedBuild) -> None:
 
 def _validate_prequalified_build(build: object) -> None:
     if not isinstance(build, PrequalifiedBuild):
-        raise InvalidIdentity("signed build must contain a prequalified build")
+        raise diagnostic_error(InvalidIdentity, _SIGNED_BUILD_MESSAGE)
 
 
 def _validate_signing_disposition(disposition: object) -> None:
     if not isinstance(disposition, SigningDisposition):
-        raise InvalidIdentity("signed build disposition must be explicit")
+        raise diagnostic_error(InvalidIdentity, _SIGNING_DISPOSITION_MESSAGE)
 
 
 def _validate_signature(signature: Artifact | None, disposition: SigningDisposition) -> None:
     if disposition is SigningDisposition.SIGNED and not isinstance(signature, Artifact):
-        raise InvalidIdentity("signed builds require a signature artifact")
+        raise diagnostic_error(InvalidIdentity, _SIGNATURE_REQUIRED_MESSAGE)
     if disposition is SigningDisposition.SIGNING_NOT_REQUIRED and signature is not None:
-        raise InvalidIdentity("unsigned policy cannot invent a signature artifact")
+        raise diagnostic_error(InvalidIdentity, _SIGNATURE_FORBIDDEN_MESSAGE)
 
 
 def _validate_canonical_content(canonical_bytes: object, content_sha256: object) -> None:
     if not isinstance(canonical_bytes, bytes) or not isinstance(content_sha256, Sha256Digest):
-        raise InvalidIdentity("canonical content must use bytes and a digest record")
+        raise diagnostic_error(InvalidIdentity, _CANONICAL_CONTENT_MESSAGE)
     if Sha256Digest.from_bytes(canonical_bytes) != content_sha256:
-        raise InvalidIdentity("canonical content digest must match exact bytes")
+        raise diagnostic_error(InvalidIdentity, _CONTENT_DIGEST_MESSAGE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,9 +286,9 @@ def _validate_qualified_envelope(envelope: object, qualification: object) -> Non
     if not isinstance(envelope, BuildEnvelope) or not isinstance(
         qualification, QualificationRecord
     ):
-        raise InvalidIdentity("qualified envelope must contain stage records")
+        raise diagnostic_error(InvalidIdentity, _QUALIFIED_ENVELOPE_MESSAGE)
     if qualification.subject != envelope.content_sha256:
-        raise InvalidIdentity("qualification subject must match envelope content digest")
+        raise diagnostic_error(InvalidIdentity, _QUALIFICATION_SUBJECT_MESSAGE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,10 +305,10 @@ class OciReference:
     manifest_sha256: Sha256Digest | None = None
 
     def __post_init__(self) -> None:
-        _require_text(self.repository, "OCI repository must be non-empty and canonical")
-        _require_text(self.tag, "OCI tag must be non-empty and canonical")
+        _require_text(self.repository, _OCI_REPOSITORY_MESSAGE)
+        _require_text(self.tag, _OCI_TAG_MESSAGE)
         if self.manifest_sha256 is not None and not isinstance(self.manifest_sha256, Sha256Digest):
-            raise InvalidIdentity("OCI manifest must be a digest record")
+            raise diagnostic_error(InvalidIdentity, _OCI_MANIFEST_MESSAGE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,8 +323,8 @@ class OrasInvocation:
     input_bytes: tuple[bytes, ...] = ()
 
     def __post_init__(self) -> None:
-        _require_tuple(self.argv, str, "ORAS arguments must be a tuple of strings")
-        _require_tuple(self.input_bytes, bytes, "ORAS inputs must be a tuple of bytes")
+        _require_tuple(self.argv, str, _ORAS_ARGUMENTS_MESSAGE)
+        _require_tuple(self.input_bytes, bytes, _ORAS_INPUTS_MESSAGE)
 
 
 class OrasOutcome(StrEnum):
@@ -302,31 +357,31 @@ def _validate_oras_result(result: OrasResult) -> None:
 
 def _validate_oras_exit_code(exit_code: object) -> None:
     if isinstance(exit_code, bool) or not isinstance(exit_code, int):
-        raise InvalidIdentity("ORAS exit code must be an integer")
+        raise diagnostic_error(InvalidIdentity, _ORAS_EXIT_CODE_MESSAGE)
 
 
 def _validate_oras_outcome(outcome: object) -> None:
     if not isinstance(outcome, OrasOutcome):
-        raise InvalidIdentity("ORAS outcome must use the typed provider classification")
+        raise diagnostic_error(InvalidIdentity, _ORAS_OUTCOME_MESSAGE)
 
 
 def _validate_oras_process_output(stdout: object, stderr: object) -> None:
     if not isinstance(stdout, bytes) or not isinstance(stderr, bytes):
-        raise InvalidIdentity("ORAS process output must be exact bytes")
+        raise diagnostic_error(InvalidIdentity, _ORAS_OUTPUT_MESSAGE)
 
 
 def _validate_oras_result_coherence(result: OrasResult) -> None:
     success = result.outcome is OrasOutcome.SUCCESS
     if success != (result.exit_code == 0):
-        raise InvalidIdentity("ORAS outcome must agree with its exit code")
+        raise diagnostic_error(InvalidIdentity, _ORAS_COHERENCE_MESSAGE)
     _validate_oras_export(result.exported_file_bytes, success)
 
 
 def _validate_oras_export(exported: object, success: bool) -> None:
     if exported is not None and not isinstance(exported, bytes):
-        raise InvalidIdentity("ORAS exported file payload must be exact bytes")
+        raise diagnostic_error(InvalidIdentity, _ORAS_EXPORT_MESSAGE)
     if not success and exported is not None:
-        raise InvalidIdentity("failed ORAS executions cannot export authoritative file bytes")
+        raise diagnostic_error(InvalidIdentity, _ORAS_FAILED_EXPORT_MESSAGE)
 
 
 def validate_attempt_id(attempt_id: str) -> None:

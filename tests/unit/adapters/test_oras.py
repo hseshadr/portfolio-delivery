@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, replace
-from typing import Final
+from types import SimpleNamespace
+from typing import Final, cast
 
 import pytest
 
+import portfolio_delivery.adapters.oras as oras_contracts
 from portfolio_delivery.adapters.oras import (
     ArtifactConflict,
     MalformedProviderResponse,
@@ -15,7 +17,14 @@ from portfolio_delivery.adapters.oras import (
     ProviderTimeout,
     ProviderUnavailable,
 )
-from portfolio_delivery.domain.artifacts import Artifact, Evidence, EvidenceStatus, Sbom
+from portfolio_delivery.domain.artifacts import (
+    Artifact,
+    Evidence,
+    EvidenceStatus,
+    LockIdentity,
+    Sbom,
+    ToolchainIdentity,
+)
 from portfolio_delivery.domain.identity import (
     ArtifactPath,
     ProjectId,
@@ -28,6 +37,7 @@ from portfolio_delivery.domain.stages import (
     EnvelopeBundle,
     OciReference,
     OrasOutcome,
+    OrasResult,
     PrequalifiedBuild,
     QualificationRecord,
     QualifiedEnvelope,
@@ -47,7 +57,11 @@ from portfolio_delivery.envelope.builder import (
     ReleasePolicyMetadata,
 )
 from portfolio_delivery.envelope.canonical import canonical_json_bytes
-from portfolio_delivery.envelope.documents import EvidenceDocument, QualificationRecordDocument
+from portfolio_delivery.envelope.documents import (
+    BuildEnvelopeDocument,
+    EvidenceDocument,
+    QualificationRecordDocument,
+)
 from tests.fakes.oras import FakeFile, FakeOrasRunner
 
 REPOSITORY: Final[str] = "ghcr.io/hseshadr/delivery"
@@ -129,6 +143,18 @@ def make_signed_bundle() -> EnvelopeBundle:
     prequalified = make_signed((artifact,), (make_sbom(artifact),)).prequalified
     signed = SignedBuild(prequalified, signature, SigningDisposition.SIGNED)
     return make_qualified_bundle(signed, (artifact, signature))
+
+
+def make_identity_bundle() -> EnvelopeBundle:
+    artifact = make_artifact()
+    signed = make_signed((artifact,), (make_sbom(artifact),))
+    unsigned = replace(
+        signed.prequalified.unsigned,
+        locks=(LockIdentity(ArtifactPath("uv.lock"), make_digest(b"lock")),),
+        toolchains=(ToolchainIdentity("python", "3.13.14", make_digest(b"python")),),
+    )
+    prequalified = replace(signed.prequalified, unsigned=unsigned)
+    return make_qualified_bundle(replace(signed, prequalified=prequalified), (artifact,))
 
 
 def make_qualified_bundle(signed: SignedBuild, artifacts: tuple[Artifact, ...]) -> EnvelopeBundle:
@@ -494,6 +520,28 @@ async def test_should_restore_exact_envelope_and_payload_metadata() -> None:
 
 
 @pytest.mark.asyncio
+async def test_should_restore_exact_lock_and_toolchain_fields() -> None:
+    # Given
+    bundle = make_identity_bundle()
+    runner = FakeOrasRunner(
+        (
+            FakeFile("artifacts/package.whl", ARTIFACT_BYTES),
+            FakeFile("sbom/package.cdx.json", SBOM_BYTES),
+        )
+    )
+    adapter = OrasAdapter(runner, REPOSITORY)
+
+    # When
+    stored = await adapter.persist(bundle, "attempt-identity-write")
+    restored = await adapter.restore(stored.reference, "attempt-identity-restore")
+
+    # Then
+    unsigned = restored.qualified.envelope.signed.prequalified.unsigned
+    assert unsigned.locks == bundle.qualified.envelope.signed.prequalified.unsigned.locks
+    assert unsigned.toolchains == bundle.qualified.envelope.signed.prequalified.unsigned.toolchains
+
+
+@pytest.mark.asyncio
 async def test_should_restore_exact_signed_stage_graph() -> None:
     bundle = make_signed_bundle()
     runner = FakeOrasRunner(
@@ -644,6 +692,336 @@ def test_should_reject_unbounded_layer_path_before_push() -> None:
 
     with pytest.raises(ValueError, match="path"):
         scenario.adapter.plan_push(bundle)
+
+
+def test_should_reject_non_bundle_contract_before_planning() -> None:
+    with pytest.raises(ValueError):
+        oras_contracts._validate_bundle(cast(EnvelopeBundle, object()))
+
+
+def test_should_preserve_every_validated_bundle_component() -> None:
+    validated = oras_contracts._validate_bundle(make_bundle())
+
+    assert validated.envelope_document == validated.bundle.qualified.envelope.document
+    assert validated.qualification_document == validated.bundle.qualified.qualification.document
+    assert validated.artifacts == make_bundle().artifacts
+    assert validated.sboms == make_bundle().sboms
+
+
+def test_should_reject_bundle_document_that_differs_from_exact_bytes() -> None:
+    bundle = make_bundle()
+    envelope = replace(
+        bundle.qualified.envelope,
+        document=make_two_artifact_bundle().qualified.envelope.document,
+    )
+    poisoned = replace(bundle, qualified=replace(bundle.qualified, envelope=envelope))
+
+    with pytest.raises(ValueError):
+        oras_contracts._validate_bundle(poisoned)
+
+
+def test_should_reject_qualification_document_that_differs_from_exact_bytes() -> None:
+    bundle = make_bundle()
+    record = replace(
+        bundle.qualified.qualification,
+        document=poison_qualification(bundle).qualified.qualification.document,
+    )
+    poisoned = replace(bundle, qualified=replace(bundle.qualified, qualification=record))
+
+    with pytest.raises(ValueError):
+        oras_contracts._validate_bundle(poisoned)
+
+
+def test_should_reject_bundle_sbom_set_that_differs_from_envelope() -> None:
+    with pytest.raises(ValueError):
+        oras_contracts._validate_bundle(replace(make_bundle(), sboms=()))
+
+
+@pytest.mark.parametrize("actual", ([], ("wrong-type",)))
+def test_should_reject_non_tuple_or_wrong_typed_record_set(actual: object) -> None:
+    expected = make_bundle().artifacts
+
+    assert not oras_contracts._same_records(
+        actual, expected, Artifact, oras_contracts._artifact_key
+    )
+
+
+def test_should_translate_invalid_local_documents_to_value_error() -> None:
+    with pytest.raises(ValueError):
+        oras_contracts._local_envelope_document(b"{}")
+    with pytest.raises(ValueError):
+        oras_contracts._local_qualification_document(b"{}")
+
+
+def test_should_accept_exact_repository_and_tag_bounds() -> None:
+    repository = "a/" + ("a" * 253)
+    adapter = OrasAdapter(FakeOrasRunner(), repository)
+
+    oras_contracts._validate_reference(OciReference(repository, "a" * 128))
+    assert adapter.repository == repository
+
+
+def test_should_reject_duplicate_expected_layer_paths() -> None:
+    layer = oras_contracts._exact_layer("same", "application/octet-stream", b"x")
+
+    with pytest.raises(ValueError):
+        oras_contracts._validate_expected_layers((layer, layer))
+
+
+def test_should_accept_exact_layer_text_bounds_and_reject_absolute_path() -> None:
+    digest = make_digest(b"x")
+    bounded = oras_contracts._ExpectedLayer("a" * 4_096, "m" * 255, digest, 1)
+    absolute = oras_contracts._ExpectedLayer("/absolute", "m", digest, 1)
+
+    oras_contracts._validate_layer_text(bounded)
+    with pytest.raises(ValueError):
+        oras_contracts._validate_layer_text(absolute)
+
+
+def test_should_reject_unrepresentable_source_date_epoch() -> None:
+    bundle = make_bundle()
+    envelope_document = bundle.qualified.envelope.document
+    assert isinstance(envelope_document, BuildEnvelopeDocument)
+    document = envelope_document.model_dump(by_alias=True)
+    document["sourceDateEpoch"] = 10**30
+    content = json.dumps(document, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+    envelope = replace(
+        bundle.qualified.envelope,
+        canonical_bytes=content,
+        content_sha256=make_digest(content),
+    )
+    qualified = SimpleNamespace(envelope=envelope)
+    poisoned = cast(EnvelopeBundle, SimpleNamespace(qualified=qualified))
+
+    with pytest.raises(ValueError):
+        oras_contracts._created_timestamp(poisoned)
+
+
+def test_should_preserve_exact_and_artifact_layer_contracts() -> None:
+    exact = oras_contracts._exact_layer("file", "media", b"abc")
+    artifact = oras_contracts._artifact_layer(make_artifact())
+
+    assert (exact.size, exact.exact_bytes) == (3, b"abc")
+    assert artifact.size == len(ARTIFACT_BYTES)
+
+
+def test_should_build_exact_provider_fetch_invocations() -> None:
+    manifest = oras_contracts._manifest_fetch("repo:tag")
+    blob = oras_contracts._blob_fetch("repo@sha256:digest")
+
+    assert manifest.argv == ("oras", "manifest", "fetch", "repo:tag")
+    assert blob.argv == ("oras", "blob", "fetch", "repo@sha256:digest")
+
+
+def test_should_fail_closed_for_non_successful_stdout() -> None:
+    failed = OrasResult(1, OrasOutcome.FAILURE, b"", b"failed")
+
+    with pytest.raises(ProviderUnavailable):
+        oras_contracts._successful_stdout(failed, 1)
+
+
+def test_should_accept_exact_process_and_manifest_response_bounds() -> None:
+    result = OrasResult(0, OrasOutcome.SUCCESS, b"", b"x" * 65_536)
+
+    oras_contracts._require_bounded_stderr(result)
+    assert len(oras_contracts._bounded_export(b"x" * MAX_MANIFEST_BYTES)) == MAX_MANIFEST_BYTES
+
+
+def _descriptor_from_layer(
+    layer: oras_contracts._ExpectedLayer, *, title: bool
+) -> oras_contracts._Descriptor:
+    annotations = {oras_contracts.TITLE_ANNOTATION: layer.path} if title else {}
+    size = layer.size if layer.size is not None else 0
+    return oras_contracts._Descriptor(
+        mediaType=layer.media_type, digest=layer.digest.value, size=size, annotations=annotations
+    )
+
+
+def _valid_manifest() -> oras_contracts._Manifest:
+    layers = oras_contracts._expected_layers(oras_contracts._validate_bundle(make_bundle()))
+    return oras_contracts._Manifest(
+        schemaVersion=2,
+        mediaType="application/vnd.oci.image.manifest.v1+json",
+        artifactType="application/vnd.hseshadr.portfolio-delivery.envelope.v1",
+        config=_descriptor_from_layer(layers[0], title=False),
+        layers=tuple(_descriptor_from_layer(item, title=True) for item in layers[1:]),
+        annotations={
+            oras_contracts.CREATED_ANNOTATION: oras_contracts._created_timestamp(make_bundle())
+        },
+    )
+
+
+@pytest.mark.parametrize("mutation", ("config-media", "config-annotation", "missing-core"))
+def test_should_reject_invalid_manifest_core_contract(mutation: str) -> None:
+    manifest = _valid_manifest()
+    if mutation == "config-media":
+        config = manifest.config.model_copy(update={"media_type": "wrong"})
+        manifest = manifest.model_copy(update={"config": config})
+    elif mutation == "config-annotation":
+        config = manifest.config.model_copy(update={"annotations": {"title": "bad"}})
+        manifest = manifest.model_copy(update={"config": config})
+    else:
+        manifest = manifest.model_copy(update={"layers": manifest.layers[:1]})
+    with pytest.raises(MalformedProviderResponse):
+        oras_contracts._validate_manifest_layers(manifest)
+
+
+def test_should_accept_manifest_with_exactly_required_core_layers() -> None:
+    manifest = _valid_manifest().model_copy(update={"layers": _valid_manifest().layers[:2]})
+
+    oras_contracts._validate_manifest_layers(manifest)
+
+
+def test_should_reject_missing_or_oversized_layer_title() -> None:
+    for title in (None, "a" * 4_097):
+        with pytest.raises(MalformedProviderResponse):
+            oras_contracts._require_canonical_layer_title(title)
+    oras_contracts._require_canonical_layer_title("a" * 4_096)
+
+
+def test_should_reject_conflicting_declared_manifest_digest() -> None:
+    reference = OciReference(REPOSITORY, "tag", make_digest(b"declared"))
+
+    with pytest.raises(ArtifactConflict):
+        oras_contracts._require_declared_manifest(reference, make_digest(b"actual"))
+
+
+def test_should_reject_mismatched_descriptor_and_content_cardinality() -> None:
+    descriptor = _valid_manifest().config
+
+    with pytest.raises(ValueError):
+        oras_contracts._require_descriptor_bytes((descriptor,), ())
+
+
+@pytest.mark.parametrize("content", (b"xx", b"y"))
+def test_should_reject_descriptor_size_or_digest_difference(content: bytes) -> None:
+    descriptor = _descriptor_from_layer(
+        oras_contracts._exact_layer("file", "media", b"x"), title=False
+    )
+
+    with pytest.raises(MalformedProviderResponse):
+        oras_contracts._require_descriptor_bytes((descriptor,), (content,))
+
+
+def test_should_accept_exact_maximum_blob_descriptor_size() -> None:
+    oras_contracts._require_bounded_blob_size(1_073_741_824)
+
+
+def test_should_preserve_reference_when_observation_is_stored() -> None:
+    manifest = _valid_manifest()
+    content = canonical_json_bytes(manifest)
+    observation = oras_contracts._Observation(content, make_digest(content), manifest)
+    reference = OciReference(REPOSITORY, "tag")
+
+    stored = oras_contracts._stored(reference, observation)
+    assert stored is not None
+    assert stored.reference.repository == reference.repository
+
+
+@pytest.mark.parametrize("order", ((0, 0), (1,), (-1,)))
+def test_should_reject_invalid_record_order(order: tuple[int, ...]) -> None:
+    with pytest.raises(ValueError):
+        oras_contracts._ordered(("only",), order)
+
+
+@pytest.mark.parametrize("exact", (False, True), ids=("declared-size", "reviewed-bytes"))
+def test_should_preserve_conflict_type_for_blob_mismatch(exact: bool) -> None:
+    content = b"x"
+    size = 1 if exact else 2
+    exact_bytes = b"y" if exact else None
+    layer = oras_contracts._ExpectedLayer("file", "media", make_digest(content), size, exact_bytes)
+
+    with pytest.raises(ArtifactConflict):
+        oras_contracts._require_blob(content, layer, ArtifactConflict)
+
+
+def _valid_restore_parts() -> tuple[oras_contracts._Manifest, tuple[bytes, ...]]:
+    validated = oras_contracts._validate_bundle(make_bundle())
+    contents = (
+        canonical_json_bytes(validated.config_document),
+        validated.bundle.qualified.envelope.canonical_bytes,
+        validated.bundle.qualified.qualification.canonical_bytes,
+        ARTIFACT_BYTES,
+        SBOM_BYTES,
+    )
+    return _valid_manifest(), contents
+
+
+def test_should_use_malformed_response_type_for_restored_descriptors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[type[oras_contracts.OrasAdapterError]] = []
+
+    def record_type(
+        _manifest: object, _expected: object, error_type: type[oras_contracts.OrasAdapterError]
+    ) -> None:
+        captured.append(error_type)
+
+    monkeypatch.setattr(oras_contracts, "_require_descriptors", record_type)
+    manifest, contents = _valid_restore_parts()
+    oras_contracts._restore_bundle(manifest, contents)
+    assert captured == [MalformedProviderResponse]
+
+
+def test_should_translate_invalid_restored_record_assembly() -> None:
+    validated = oras_contracts._validate_bundle(make_bundle())
+    order = validated.config_document.stage_order.model_copy(
+        update={"bundle_artifact_order": (0, 0)}
+    )
+    config = validated.config_document.model_copy(update={"stage_order": order})
+
+    with pytest.raises(MalformedProviderResponse):
+        oras_contracts._validated_assembly(
+            config,
+            validated.envelope_document,
+            validated.qualification_document,
+            validated.bundle.qualified.envelope.canonical_bytes,
+            validated.bundle.qualified.qualification.canonical_bytes,
+        )
+
+
+def test_should_translate_invalid_restored_bundle_graph() -> None:
+    config = oras_contracts._validate_bundle(make_bundle()).config_document
+
+    with pytest.raises(MalformedProviderResponse):
+        oras_contracts._validated_restored_bundle(cast(EnvelopeBundle, object()), config)
+
+
+def test_should_reject_restored_config_that_differs_from_bundle_graph() -> None:
+    bundle = make_bundle()
+    config = oras_contracts._validate_bundle(bundle).config_document
+    conflicting = config.model_copy(update={"release_idempotency_key": "different"})
+
+    with pytest.raises(MalformedProviderResponse):
+        oras_contracts._validated_restored_bundle(bundle, conflicting)
+
+
+def test_should_reject_malformed_stored_config() -> None:
+    with pytest.raises(MalformedProviderResponse):
+        oras_contracts._parse_config(b"{}")
+
+
+def test_should_reject_noncanonical_stored_documents() -> None:
+    validated = oras_contracts._validate_bundle(make_bundle())
+    values = (
+        (oras_contracts._parse_config, canonical_json_bytes(validated.config_document)),
+        (oras_contracts._parse_envelope, validated.bundle.qualified.envelope.canonical_bytes),
+        (
+            oras_contracts._parse_qualification,
+            validated.bundle.qualified.qualification.canonical_bytes,
+        ),
+    )
+    for parser, content in values:
+        with pytest.raises(MalformedProviderResponse):
+            parser(content[:-1] + b" \n")
+
+
+def test_should_reject_signature_path_without_exact_artifact() -> None:
+    validated = oras_contracts._validate_bundle(make_bundle())
+    config = validated.config_document.model_copy(update={"signature_path": "missing.sig"})
+
+    with pytest.raises(ValueError):
+        oras_contracts._signature_artifact(validated.artifacts, config)
 
 
 def conflicting_manifest(runner: FakeOrasRunner, reference: str) -> bytes:

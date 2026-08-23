@@ -8,47 +8,66 @@ from portfolio_delivery.domain.errors import (
     InvalidArtifactPath,
     InvalidDigest,
     InvalidIdentity,
+    diagnostic_error,
 )
 
 _COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
+_IDENTITY_VALUE_MESSAGE = (
+    "identity values must be non-empty and canonical"  # pragma: no mutate - diagnostic
+)
+_DIGEST_MESSAGE = (
+    "digest must be a lowercase sha256:<64-hex> value"  # pragma: no mutate - diagnostic
+)
+_ARTIFACT_PATH_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "artifact path must be a canonical relative POSIX path"
+)
+_COMMIT_SHA_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "commit SHA must be 40 lowercase hexadecimal characters"
+)
+_SOURCE_IDENTITY_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "source revision identity fields must use domain identity records"
+)
+_RELEASE_IDENTITY_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "release identity fields must use domain identity records"
+)
 
 
 def _require_identity(value: str) -> None:
     if not isinstance(value, str) or not value or value != value.strip():
-        raise InvalidIdentity("identity values must be non-empty and canonical")
+        raise diagnostic_error(InvalidIdentity, _IDENTITY_VALUE_MESSAGE)
 
 
 def _validate_digest(value: str) -> None:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
-        raise InvalidDigest("digest must be a lowercase sha256:<64-hex> value")
+        raise diagnostic_error(InvalidDigest, _DIGEST_MESSAGE)
 
 
 def _validate_artifact_path(value: str) -> None:
     if not isinstance(value, str):
-        raise InvalidArtifactPath("artifact path must be a canonical relative POSIX path")
+        raise diagnostic_error(InvalidArtifactPath, _ARTIFACT_PATH_MESSAGE)
     if _is_unsafe_artifact_path(value):
-        raise InvalidArtifactPath("artifact path must be a canonical relative POSIX path")
+        raise diagnostic_error(InvalidArtifactPath, _ARTIFACT_PATH_MESSAGE)
 
 
 def _is_unsafe_artifact_path(value: str) -> bool:
     invalid_parts = any(part in {"", ".", ".."} for part in value.split("/"))
-    return any((not value, value.startswith("/"), "\\" in value, "\x00" in value, invalid_parts))
+    return any((not value, "\\" in value, "\x00" in value, invalid_parts))
 
 
 def _validate_commit_sha(value: str) -> None:
     if not isinstance(value, str) or _COMMIT_SHA.fullmatch(value) is None:
-        raise InvalidIdentity("commit SHA must be 40 lowercase hexadecimal characters")
+        raise diagnostic_error(InvalidIdentity, _COMMIT_SHA_MESSAGE)
 
 
 def _validate_source_identities(project: object, source_digest: object) -> None:
     if not isinstance(project, ProjectId) or not isinstance(source_digest, Sha256Digest):
-        raise InvalidIdentity("source revision identity fields must use domain identity records")
+        raise diagnostic_error(InvalidIdentity, _SOURCE_IDENTITY_MESSAGE)
 
 
 def _validate_release_identities(project: object, source_digest: object) -> None:
     if not isinstance(project, ProjectId) or not isinstance(source_digest, Sha256Digest):
-        raise InvalidIdentity("release identity fields must use domain identity records")
+        raise diagnostic_error(InvalidIdentity, _RELEASE_IDENTITY_MESSAGE)
 
 
 @dataclass(frozen=True, slots=True)

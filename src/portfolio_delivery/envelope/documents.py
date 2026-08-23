@@ -6,6 +6,7 @@ from typing import Annotated, Final, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from portfolio_delivery.domain.errors import diagnostic_error
 from portfolio_delivery.domain.identity import ProjectId, Sha256Digest, SourceRevision
 from portfolio_delivery.envelope.canonical import normalize_artifact_path
 
@@ -17,6 +18,18 @@ QUALIFICATION_MEDIA_TYPE: Final = (
 )
 CONFIG_MEDIA_TYPE: Final = "application/vnd.hseshadr.portfolio-delivery.config.v1+json"
 type OciOrderIndex = Annotated[int, Field(ge=0, strict=True)]
+_IDEMPOTENCY_KEY_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "release idempotency key must be non-empty and canonical"
+)
+_CONFIG_SIGNATURE_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "signed config provenance requires exactly one signature path"
+)
+_DUPLICATE_PATH_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "normalized document paths must be unique"
+)
+_DUPLICATE_EVIDENCE_MESSAGE = (  # pragma: no mutate - non-contractual diagnostic text
+    "evidence kind and name must be unique"
+)
 
 
 class BoundaryDocument(BaseModel):  # type: ignore[explicit-any]
@@ -276,7 +289,7 @@ class OciConfigDocument(BoundaryDocument):  # type: ignore[explicit-any]
     @classmethod
     def validate_idempotency_key(cls, value: str) -> str:
         if not value or value != value.strip():
-            raise ValueError("release idempotency key must be non-empty and canonical")
+            raise diagnostic_error(ValueError, _IDEMPOTENCY_KEY_MESSAGE)
         return value
 
     @field_validator("signature_path")
@@ -290,16 +303,16 @@ class OciConfigDocument(BoundaryDocument):  # type: ignore[explicit-any]
     def validate_signing_coherence(self) -> Self:
         has_signature = self.signature_path is not None
         if (self.signing_disposition == "signed") != has_signature:
-            raise ValueError("signed config provenance requires exactly one signature path")
+            raise diagnostic_error(ValueError, _CONFIG_SIGNATURE_MESSAGE)
         return self
 
 
 def _reject_duplicates(values: tuple[str, ...]) -> None:
     if len(values) != len(set(values)):
-        raise ValueError("normalized document paths must be unique")
+        raise diagnostic_error(ValueError, _DUPLICATE_PATH_MESSAGE)
 
 
 def _reject_duplicate_evidence(values: tuple[EvidenceDocument, ...]) -> None:
     keys = tuple((item.kind, item.name) for item in values)
     if len(keys) != len(set(keys)):
-        raise ValueError("evidence kind and name must be unique")
+        raise diagnostic_error(ValueError, _DUPLICATE_EVIDENCE_MESSAGE)
