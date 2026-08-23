@@ -32,13 +32,13 @@ from portfolio_delivery.domain.stages import (
 from portfolio_delivery.envelope.builder import (
     EnvelopeBuilder,
     EnvelopeMetadata,
+    PinnedCompatibility,
+    ProjectAdapterVersion,
     QualificationBuilder,
+    ReleaseChannel,
+    ReleasePolicyMetadata,
 )
-from portfolio_delivery.envelope.documents import (
-    BuildEnvelopeDocument,
-    CompatibilityDocument,
-    ReleasePolicyDocument,
-)
+from portfolio_delivery.envelope.documents import BuildEnvelopeDocument
 
 SOURCE_DATE_EPOCH: Final[int] = 1_724_472_000
 
@@ -87,10 +87,10 @@ def make_final_check(envelope_digest: Sha256Digest, status: EvidenceStatus) -> E
 
 def make_metadata() -> EnvelopeMetadata:
     return EnvelopeMetadata(
-        "1.0.0",
+        ProjectAdapterVersion("1.0.0"),
         SOURCE_DATE_EPOCH,
-        ReleasePolicyDocument(version="v1.2.3", channels=("stable",)),
-        CompatibilityDocument(dagger="0.21.8", oras="1.3.3"),
+        ReleasePolicyMetadata("v1.2.3", (ReleaseChannel.STABLE,)),
+        PinnedCompatibility("0.21.8", "1.3.3"),
     )
 
 
@@ -213,10 +213,10 @@ def test_should_require_declared_metadata_when_builder_is_created() -> None:
 def test_should_reject_policy_that_disagrees_with_release_when_envelope_is_assembled() -> None:
     # Given
     metadata = EnvelopeMetadata(
-        "1.0.0",
+        ProjectAdapterVersion("1.0.0"),
         SOURCE_DATE_EPOCH,
-        ReleasePolicyDocument(version="v9.9.9", channels=("stable",)),
-        CompatibilityDocument(dagger="0.21.8", oras="1.3.3"),
+        ReleasePolicyMetadata("v9.9.9", (ReleaseChannel.STABLE,)),
+        PinnedCompatibility("0.21.8", "1.3.3"),
     )
 
     # When / Then
@@ -225,25 +225,44 @@ def test_should_reject_policy_that_disagrees_with_release_when_envelope_is_assem
 
 
 @pytest.mark.parametrize(
+    "factory",
+    (
+        lambda: ProjectAdapterVersion("tbd"),
+        lambda: ProjectAdapterVersion("1.0"),
+        lambda: ReleasePolicyMetadata("release-1", (ReleaseChannel.STABLE,)),
+        lambda: ReleasePolicyMetadata("v1.2.3", cast(tuple[ReleaseChannel, ...], ("tbd",))),
+        lambda: PinnedCompatibility("0.22.0", "1.3.3"),
+        lambda: PinnedCompatibility("0.21.8", "1.3.4"),
+    ),
+)
+def test_should_reject_nonpinned_metadata_values_when_created(
+    factory: Callable[[], object],
+) -> None:
+    # Given / When / Then
+    with pytest.raises(InvalidIdentity):
+        factory()
+
+
+@pytest.mark.parametrize(
     "metadata",
     (
         lambda: EnvelopeMetadata(
-            "not-recorded",
+            cast(ProjectAdapterVersion, "1.0.0"),
             1_724_472_000,
-            ReleasePolicyDocument(version="v1.2.3", channels=("stable",)),
-            CompatibilityDocument(dagger="0.21.8", oras="1.3.3"),
+            ReleasePolicyMetadata("v1.2.3", (ReleaseChannel.STABLE,)),
+            PinnedCompatibility("0.21.8", "1.3.3"),
         ),
         lambda: EnvelopeMetadata(
-            "1.0.0",
+            ProjectAdapterVersion("1.0.0"),
             0,
-            ReleasePolicyDocument(version="v1.2.3", channels=("stable",)),
-            CompatibilityDocument(dagger="0.21.8", oras="1.3.3"),
+            ReleasePolicyMetadata("v1.2.3", (ReleaseChannel.STABLE,)),
+            PinnedCompatibility("0.21.8", "1.3.3"),
         ),
         lambda: EnvelopeMetadata(
-            "1.0.0",
+            ProjectAdapterVersion("1.0.0"),
             1_724_472_000,
-            ReleasePolicyDocument(version="v1.2.3", channels=()),
-            CompatibilityDocument(dagger="0.21.8", oras="1.3.3"),
+            ReleasePolicyMetadata("v1.2.3", cast(tuple[ReleaseChannel, ...], ())),
+            PinnedCompatibility("0.21.8", "1.3.3"),
         ),
     ),
 )

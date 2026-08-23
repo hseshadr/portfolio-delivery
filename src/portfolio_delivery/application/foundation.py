@@ -114,6 +114,8 @@ def _require_qualification_subject(
 def _require_evidence_subjects(
     envelope: BuildEnvelope, document: QualificationRecordDocument
 ) -> None:
+    if document.subject != envelope.content_sha256.value:
+        raise InvalidIdentity("final qualification document must target the final envelope digest")
     subjects = tuple(item.subject for item in document.qualification_evidence)
     if any(subject != envelope.content_sha256.value for subject in subjects):
         raise InvalidIdentity("final qualification evidence must target the final envelope digest")

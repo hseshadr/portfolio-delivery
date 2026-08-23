@@ -27,15 +27,14 @@ from portfolio_delivery.domain.stages import (
 from portfolio_delivery.envelope.builder import (
     EnvelopeBuilder,
     EnvelopeMetadata,
+    PinnedCompatibility,
+    ProjectAdapterVersion,
     QualificationBuilder,
+    ReleaseChannel,
+    ReleasePolicyMetadata,
 )
 from portfolio_delivery.envelope.canonical import canonical_sha256, normalize_artifact_path
-from portfolio_delivery.envelope.documents import (
-    ArtifactDocument,
-    BuildEnvelopeDocument,
-    CompatibilityDocument,
-    ReleasePolicyDocument,
-)
+from portfolio_delivery.envelope.documents import ArtifactDocument, BuildEnvelopeDocument
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "envelope"
 GOLDEN_DIGEST = "sha256:0ad3c5c22295b7a43259815f9674df1321e578ac66a8b370f508bc34e8d7e31b"
@@ -189,8 +188,8 @@ def make_signed_build(name: str) -> SignedBuild:
 
 def make_metadata() -> EnvelopeMetadata:
     return EnvelopeMetadata(
-        "1.0.0",
+        ProjectAdapterVersion("1.0.0"),
         1_724_472_000,
-        ReleasePolicyDocument(version="v1.2.3", channels=("stable",)),
-        CompatibilityDocument(dagger="0.21.8", oras="1.3.3"),
+        ReleasePolicyMetadata("v1.2.3", (ReleaseChannel.STABLE,)),
+        PinnedCompatibility("0.21.8", "1.3.3"),
     )

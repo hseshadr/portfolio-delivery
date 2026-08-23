@@ -34,15 +34,14 @@ from portfolio_delivery.domain.stages import (
 from portfolio_delivery.envelope.builder import (
     EnvelopeBuilder,
     EnvelopeMetadata,
+    PinnedCompatibility,
+    ProjectAdapterVersion,
     QualificationBuilder,
+    ReleaseChannel,
+    ReleasePolicyMetadata,
 )
 from portfolio_delivery.envelope.canonical import canonical_json_bytes
-from portfolio_delivery.envelope.documents import (
-    CompatibilityDocument,
-    EvidenceDocument,
-    QualificationRecordDocument,
-    ReleasePolicyDocument,
-)
+from portfolio_delivery.envelope.documents import EvidenceDocument, QualificationRecordDocument
 
 
 def make_digest(character: str) -> Sha256Digest:
@@ -87,10 +86,10 @@ def make_signature() -> Artifact:
 
 def make_metadata() -> EnvelopeMetadata:
     return EnvelopeMetadata(
-        "1.0.0",
+        ProjectAdapterVersion("1.0.0"),
         1_724_472_000,
-        ReleasePolicyDocument(version="v1.2.3", channels=("stable",)),
-        CompatibilityDocument(dagger="0.21.8", oras="1.3.3"),
+        ReleasePolicyMetadata("v1.2.3", (ReleaseChannel.STABLE,)),
+        PinnedCompatibility("0.21.8", "1.3.3"),
     )
 
 
@@ -221,6 +220,27 @@ class WrongSubjectVerifier:
         canonical_bytes = canonical_json_bytes(document)
         return QualificationRecord(
             make_digest("9"), document, canonical_bytes, Sha256Digest.from_bytes(canonical_bytes)
+        )
+
+
+class DocumentSubjectVerifier:
+    def __init__(self, prequalified: PrequalifiedBuild) -> None:
+        self.prequalified = prequalified
+
+    async def prequalify(self, build: UnsignedBuild, plan: VerificationPlan) -> PrequalifiedBuild:
+        return self.prequalified
+
+    async def qualify(self, envelope: BuildEnvelope, plan: VerificationPlan) -> QualificationRecord:
+        document = QualificationRecordDocument(
+            subject=make_digest("9").value,
+            qualificationEvidence=(),
+        )
+        canonical_bytes = canonical_json_bytes(document)
+        return QualificationRecord(
+            envelope.content_sha256,
+            document,
+            canonical_bytes,
+            Sha256Digest.from_bytes(canonical_bytes),
         )
 
 
@@ -404,6 +424,23 @@ async def test_should_reject_wrong_qualification_subject_when_verifier_qualifies
 
     # When / Then
     with pytest.raises(InvalidIdentity, match="final envelope digest"):
+        await service.qualify(
+            make_source(),
+            InputSnapshotPlan(("src",)),
+            BuildPlan("build", ("uv build",)),
+            SigningPolicy.none(),
+            VerificationPlan(("archive",)),
+        )
+
+
+async def test_should_reject_forged_document_subject_when_verifier_qualifies() -> None:
+    # Given
+    events: list[str] = []
+    prequalified = make_prequalified()
+    service = make_service(events, RecordingStore(), DocumentSubjectVerifier(prequalified))
+
+    # When / Then
+    with pytest.raises(InvalidIdentity, match="document must target"):
         await service.qualify(
             make_source(),
             InputSnapshotPlan(("src",)),
