@@ -78,9 +78,11 @@ def _reject_duplicate_keys(pairs: list[tuple[str, JsonValue]]) -> JsonObject:
 
 
 def _reject_nonfinite_value(value: JsonValue) -> None:
-    _reject_nonfinite_float(value)
-    _reject_nonfinite_list(value)
-    _reject_nonfinite_object(value)
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        _reject_nonfinite_float(current)
+        pending.extend(_nested_values(current))
 
 
 def _reject_nonfinite_float(value: JsonValue) -> None:
@@ -88,16 +90,12 @@ def _reject_nonfinite_float(value: JsonValue) -> None:
         raise ValueError("non-finite JSON number is forbidden")
 
 
-def _reject_nonfinite_list(value: JsonValue) -> None:
+def _nested_values(value: JsonValue) -> list[JsonValue]:
     if isinstance(value, list):
-        for item in value:
-            _reject_nonfinite_value(item)
-
-
-def _reject_nonfinite_object(value: JsonValue) -> None:
+        return value
     if isinstance(value, dict):
-        for item in value.values():
-            _reject_nonfinite_value(item)
+        return list(value.values())
+    return []
 
 
 def _reject_nonfinite(value: str) -> None:

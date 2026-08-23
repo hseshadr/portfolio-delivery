@@ -118,6 +118,65 @@ def test_should_reject_duplicate_build_ownership_key_when_document_is_parsed() -
         BuildEnvelopeDocument.model_validate(payload)
 
 
+def test_should_reject_duplicate_artifact_path_when_document_is_parsed() -> None:
+    # Given
+    payload = cast(dict[str, object], json.loads(fixture_bytes("input/build-input.json")))
+    artifacts = cast(list[dict[str, object]], payload["artifacts"])
+    artifacts.append(
+        {
+            "name": "package-copy",
+            "path": "artifacts/package.whl",
+            "mediaType": "application/vnd.python.wheel",
+            "size": 35,
+            "sha256": _digest("f"),
+        }
+    )
+
+    # When / Then
+    with pytest.raises(ValidationError):
+        BuildEnvelopeDocument.model_validate(payload)
+
+
+def test_should_reject_duplicate_sbom_path_when_document_is_parsed() -> None:
+    # Given
+    payload = cast(dict[str, object], json.loads(fixture_bytes("input/build-input.json")))
+    sboms = cast(list[dict[str, object]], payload["sboms"])
+    sboms.append(
+        {
+            "artifactPath": "artifacts/alpha.txt",
+            "path": "sbom/package.cdx.json",
+            "mediaType": "application/vnd.cyclonedx+json",
+            "sha256": _digest("f"),
+        }
+    )
+
+    # When / Then
+    with pytest.raises(ValidationError):
+        BuildEnvelopeDocument.model_validate(payload)
+
+
+def test_should_reject_duplicate_toolchain_name_when_document_is_parsed() -> None:
+    # Given
+    payload = cast(dict[str, object], json.loads(fixture_bytes("input/build-input.json")))
+    toolchains = cast(list[dict[str, object]], payload["toolchains"])
+    toolchains.append({"name": "python", "version": "3.14", "sha256": _digest("b")})
+
+    # When / Then
+    with pytest.raises(ValidationError):
+        BuildEnvelopeDocument.model_validate(payload)
+
+
+def test_should_reject_duplicate_build_evidence_key_when_document_is_parsed() -> None:
+    # Given
+    payload = cast(dict[str, object], json.loads(fixture_bytes("input/build-input.json")))
+    evidence = cast(list[dict[str, object]], payload["prequalificationEvidence"])
+    evidence.append({"kind": "test", "name": "unit", "subject": _digest("c"), "status": "failed"})
+
+    # When / Then
+    with pytest.raises(ValidationError):
+        BuildEnvelopeDocument.model_validate(payload)
+
+
 def test_should_reject_duplicate_lock_path_when_document_is_parsed() -> None:
     # Given
     payload = cast(dict[str, object], json.loads(fixture_bytes("input/build-input.json")))
@@ -155,6 +214,26 @@ def test_should_reject_duplicate_qualification_evidence_key_when_document_is_par
     # When / Then
     with pytest.raises(ValidationError):
         QualificationRecordDocument.model_validate(payload)
+
+
+def test_should_parse_deeply_nested_finite_json_without_recursion_error() -> None:
+    # Given
+    content = _nested_json(500, b"0")
+
+    # When
+    parsed = parse_bounded_json(content, 1_048_576)
+
+    # Then
+    assert "nested" in parsed
+
+
+def test_should_reject_deeply_nested_nonfinite_json_without_recursion_error() -> None:
+    # Given
+    content = _nested_json(500, b"1e400")
+
+    # When / Then
+    with pytest.raises(ValueError):
+        parse_bounded_json(content, 1_048_576)
 
 
 def _add_distinct_build_collection_items(payload: dict[str, object]) -> None:
@@ -196,3 +275,7 @@ def _alpha_sbom() -> dict[str, object]:
 
 def _digest(character: str) -> str:
     return f"sha256:{character * 64}"
+
+
+def _nested_json(depth: int, terminal: bytes) -> bytes:
+    return (b'{"nested":' * depth) + terminal + (b"}" * depth)
