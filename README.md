@@ -2,192 +2,90 @@
 
 ## TL;DR
 
-Portfolio Delivery turns declared source, artifact, SBOM, and verification inputs into one
-canonical release envelope, attaches final qualification without changing that envelope, and
-persists the exact bytes idempotently as a generic OCI artifact. Dagger runs the graph; typed
-Python contracts keep the release logic independent of GitHub and registry implementations.
-
-Run the full local proof:
+Portfolio Delivery is a small Dagger `v0.21.8` module with four checks and two user goals:
 
 ```bash
-uv sync --python 3.13.14
-uv run poe lock-check
-uv run poe test
-dagger functions
-uv run poe test-dagger -q
-uv run poe demo-local-oci
+dagger check
+dagger call build -o ./dist/module
+dagger call publish \
+  --registry=ghcr.io \
+  --address=ghcr.io/OWNER/portfolio-delivery:TAG \
+  --username=OWNER \
+  --password=env:GITHUB_TOKEN
 ```
 
-The final command starts a pinned, storage-less local Registry service inside Dagger, submits the
-same qualified envelope twice, restores it, stops the service in `finally`, and prints a bounded
-JSON proof. It does not publish or deploy anything outside the local Dagger session.
+`build` returns a native `Directory`. `publish` uses native `Container.publish` and accepts the
+registry password as a native `Secret`. There is no release framework, controller, workflow
+renderer, artifact DTO, repository layer, or custom OCI client.
 
-## Why this exists
+## Why
 
-Assay, EdgeReco, AlmaMesh, AML Filter, and future portfolio projects need the same release safety
-properties without copying mutable shell workflows between repositories. This foundation provides
-one composable sequence:
+Dagger already supplies the execution graph, content-addressed caching, typed files and
+directories, services, secret handling, OCI image publication, checks, and traces. Rebuilding
+those capabilities made the previous implementation difficult to use and maintain.
 
-1. snapshot declared Git-tree inputs;
-2. build artifacts and CycloneDX SBOMs;
-3. retain prequalification evidence;
-4. create deterministic canonical envelope bytes;
-5. attach detached final qualification for that exact envelope digest; and
-6. reconcile the qualified bytes into content-addressed OCI storage.
+This module follows the official design:
 
-GitHub remains the control plane for protected events, OIDC, concurrency, attestations, and
-deployment status. The Dagger graph is the execution and artifact plane. Project behavior enters
-through narrow contracts and composed adapters, so adding another project does not fork the core.
-
-## Source tree map
-
-Every shipped Python source has one responsibility:
-
-- `src/portfolio_delivery/__init__.py` — package boundary and public version.
-- `src/portfolio_delivery/adapters/__init__.py` — provider-adapter namespace.
-- `src/portfolio_delivery/adapters/oras.py` — pure ORAS planning, reconciliation, and restore.
-- `src/portfolio_delivery/application/__init__.py` — application-service namespace.
-- `src/portfolio_delivery/application/foundation.py` — composed release lifecycle service.
-- `src/portfolio_delivery/contracts/__init__.py` — typed-contract namespace.
-- `src/portfolio_delivery/contracts/build.py` — project build and check ports.
-- `src/portfolio_delivery/contracts/oci.py` — shared OCI resource policy.
-- `src/portfolio_delivery/contracts/release.py` — source and release authority ports.
-- `src/portfolio_delivery/contracts/storage.py` — storage and ORAS runner ports.
-- `src/portfolio_delivery/domain/__init__.py` — domain namespace.
-- `src/portfolio_delivery/domain/artifacts.py` — artifacts, SBOMs, locks, and evidence records.
-- `src/portfolio_delivery/domain/errors.py` — concrete domain failures.
-- `src/portfolio_delivery/domain/identity.py` — canonical paths, digests, and release identities.
-- `src/portfolio_delivery/domain/stages.py` — immutable release-stage graph.
-- `src/portfolio_delivery/envelope/__init__.py` — envelope namespace.
-- `src/portfolio_delivery/envelope/builder.py` — envelope and qualification builders.
-- `src/portfolio_delivery/envelope/canonical.py` — bounded canonical JSON.
-- `src/portfolio_delivery/envelope/documents.py` — closed-world boundary documents.
-- `.dagger/src/portfolio_delivery_dagger/__init__.py` — generated Dagger module entrypoint.
-- `.dagger/src/portfolio_delivery_dagger/dto.py` — Dagger-facing transfer objects.
-- `.dagger/src/portfolio_delivery_dagger/interfaces.py` — project composition interfaces.
-- `.dagger/src/portfolio_delivery_dagger/inventory.py` — bounded file inventory documents.
-- `.dagger/src/portfolio_delivery_dagger/main.py` — public Dagger lifecycle functions.
-- `.dagger/src/portfolio_delivery_dagger/oras.py` — container-backed ORAS runner adapter.
-- `.dagger/src/portfolio_delivery_dagger/plan.py` — immutable direct-plan adapter.
-
-## Prerequisites and exact pins
-
-- Python `3.13.14` and `uv` on `PATH`; wheels use the exact `uv_build==0.8.24` backend.
-- CycloneDX Python Library `11.12.0` with its official JSON validator (locked development tool).
-- Dagger CLI `v0.21.8`; the module also declares engine `v0.21.8`.
-- A local Dagger-compatible container runtime and network access for the first pinned image pull.
-- ORAS `v1.3.3` from
-  `ghcr.io/oras-project/oras@sha256:a4c54befd87d0366e0ba3ac3a9536a5288c8a3735acd3b635cdace59a2c559c8`.
-- Local Registry
-  `registry:3.0.0@sha256:6c5666b861f3505b116bb9aa9b25175e71210414bd010d92035ff64018f9457e`.
-
-[`toolchain.lock.toml`](toolchain.lock.toml) is the authoritative complete matrix, including the
-Dagger source commit and engine digest, the Python runtime image, GitHub integration commit, Node,
-Wrangler, Vitest pool worker, and Release Please pins. `uv.lock` is the authoritative Python
-dependency resolution.
+- the workspace supplies only the files each function needs;
+- checks run with `dagger check` locally and in CI;
+- functions expose user goals rather than internal stages;
+- functions return Dagger core objects so callers can keep composing;
+- publication delegates the side effect to the engine's native `Container.publish` operation.
 
 ## Quickstart
 
-From a clean checkout:
+Prerequisites: Dagger `v0.21.8`, Python `3.13.14`, and `uv`.
 
 ```bash
 uv sync --python 3.13.14
 uv run poe lock-check
-uv run poe test
 dagger functions
-uv run poe test-dagger -q tests/dagger/test_oras_service.py
+dagger check
+dagger call build -o ./dist/module
 ```
 
-Poe 0.48 passes trailing arguments directly, so these commands intentionally omit the obsolete
-`--` separator. The test command proves the real ORAS adapter against the pinned local Registry,
-including repeated inspection, one write, manifest identity, exact restore, and secret canaries.
+The build output is the self-contained module source needed by Dagger. Documentation and tests
+are deliberately excluded from its cache key.
 
-To prove generated Dagger bindings have not drifted:
+## API
 
-```bash
-dagger develop
-git diff --exit-code -- dagger.json .dagger/sdk .dagger/uv.lock
-```
+| Function | Result | Purpose |
+|---|---|---|
+| `build` | `Directory` | Return the exportable module source |
+| `lint` | `Container` check | Ruff lint and formatting |
+| `typecheck` | `Container` check | Strict mypy |
+| `complexity` | `Container` check | Xenon grade A |
+| `unit` | `Container` check | Host-independent contract tests |
+| `publish` | digest-pinned `str` | Publish through native OCI support |
 
-## Realistic local OCI demonstration
+GitHub Actions is only a pinned trigger for `dagger check`; it contains no delivery logic.
 
-The demo consumes the checked-in wheel, CycloneDX 1.6 SBOM, and prequalification evidence under
-`tests/fixtures/envelope/input`. It invokes the tested `public-oras-smoke` Dagger function, which
-creates the envelope, attaches detached qualification, performs two identical persistence
-attempts, restores exact bytes, and owns the Registry service lifecycle.
+## Reuse before code
 
-The wheel is a real `py3-none-any` archive containing the importable `portfolio_delivery` package,
-not placeholder bytes. Its CycloneDX component records the same project name and version, a purl,
-and the wheel SHA-256. Unit tests rebuild the wheel in two independent clean source directories,
-regenerate the SBOM twice with the official library, require byte-identical output, validate the
-CycloneDX 1.6 schema, and verify the build-input declarations against both files.
+Before adding code:
 
-```bash
-uv run poe demo-local-oci
-```
+1. Check Dagger core types and functions.
+2. Search official Dagger modules and toolchains.
+3. Search maintained ecosystem modules.
+4. Add custom code only with a written gap and a behavior test.
 
-To regenerate only the reviewed wheel and its deterministic SBOM after an intentional source
-change, use the pinned backend and the envelope's fixed epoch; the semantic fixture test then
-fails until the reviewed build-input and golden envelope declarations are updated:
+Examples of native replacements are `Workspace.directory` for source selection, `@check` for
+validation, `CacheVolume` for tool caches, `Secret` for credentials, `Service` for dependencies,
+`Changeset` for generated edits, and `Container.publish` for container publication.
 
-```bash
-SOURCE_DATE_EPOCH=1724472000 uv build --wheel --no-sources --out-dir dist .
-cp dist/portfolio_delivery-0.1.0-py3-none-any.whl \
-  tests/fixtures/envelope/input/artifacts/portfolio_delivery-0.1.0-py3-none-any.whl
-uv run python scripts/build-release-sbom.py \
-  --wheel tests/fixtures/envelope/input/artifacts/portfolio_delivery-0.1.0-py3-none-any.whl \
-  --output tests/fixtures/envelope/input/sbom/package.cdx.json \
-  --source-date-epoch 1724472000
-uv run pytest -q tests/unit/test_release_fixtures.py tests/unit/envelope/test_canonical.py
-```
+## Enforced size limits
 
-The output is one canonical JSON object with this bounded shape:
+- Handwritten production Python: at most 400 lines; target 300 or fewer.
+- Handwritten Python tests: at most 800 lines.
+- GitHub trigger: 15–30 lines.
+- Generated Dagger SDK and lock files are excluded.
 
-```json
-{"attempts":2,"envelope_sha256":"sha256:<64 lowercase hex>","exact_restore":true,"manifest_sha256":"sha256:<64 lowercase hex>","provider_writes":1}
-```
+A change is rejected if it adds a custom DTO for a Dagger core type, wraps a single native
+operation, adds a controller to ordinary CI, duplicates Dagger caching or secret handling, or
+cannot show why a native feature or maintained dependency is insufficient.
 
-`envelope_sha256` identifies the canonical build-envelope bytes and is independently recomputed
-from those bytes before the URI is trusted.
-`manifest_sha256` identifies the OCI manifest produced by the provider. `attempts: 2` with
-`provider_writes: 1` is derived from two distinct validated provider attempt identities and is the
-observable idempotency proof; `exact_restore: true` covers the envelope, detached qualification,
-wheel, and SBOM bytes.
+## Deliberate boundary
 
-## Quality and architecture gates
-
-```bash
-uv run poe lint
-uv run poe typecheck
-uv run poe complexity
-uv run poe test
-uv run poe mutation
-uv run poe benchmark-oci-limits
-uv run poe audit
-```
-
-The mutation task scopes mutations to `domain`, `envelope`, and the pure ORAS adapter, exports
-`mutmut-cicd-stats.json`, and fails closed for survived, untested, suspicious, timed-out,
-segfaulted, or interrupted mutations. Pure `domain`, `contracts`, `envelope`, and `application`
-modules are also imported in an isolated process with Dagger, provider, network, process, socket,
-and filesystem delivery dependencies blocked.
-
-The metadata-only benchmark evaluates the exact shared limit—256 descriptors, 64 MiB per file,
-and 512 MiB total—without allocating artifact payloads. It prints bounded JSON with cold and warm
-p50/p95 timings; tests validate the scenario and output schema without imposing machine-dependent
-timing thresholds.
-
-## Phase 1 limitations
-
-Phase 1 deliberately stops at a qualified, locally persisted OCI envelope:
-
-- it does not publish npm packages;
-- it does not publish PyPI packages;
-- it does not deploy applications; and
-- it does not provide the durable release authority that authorizes tags or production mutation.
-
-Those control-plane and project-migration capabilities belong to later phases. The approved full
-architecture is in
-[`docs/superpowers/specs/2026-08-22-portfolio-delivery-design.md`](docs/superpowers/specs/2026-08-22-portfolio-delivery-design.md).
-Hosted CI is not shipped in Phase 1; it belongs to Phase 3. This repository intentionally does not
-add an ad-hoc workflow before that control-plane design is implemented.
+Dagger caching is not a durable cross-run release ledger. If a future product truly requires
+cross-repository compare-and-set coordination, that service must be optional, separate, and
+justified by real consumers. Ordinary check, build, and publish flows do not depend on one.

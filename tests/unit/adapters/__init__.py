@@ -1,1 +1,0 @@
-"""ORAS adapter unit tests."""
