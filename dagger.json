@@ -5,12 +5,15 @@
     "source": "python"
   },
   "include": [
-    "src/**",
-    "pyproject.toml",
-    "README.md",
+    ".dagger/pyproject.toml",
+    ".dagger/sdk/**",
+    ".dagger/src/**",
+    ".dagger/uv.lock",
+    ".python-version",
     "LICENSE",
-    "uv.lock",
-    "toolchain.lock.toml"
+    "pyproject.toml",
+    "tests/test_modern_dagger_contract.py",
+    "uv.lock"
   ],
   "source": ".dagger"
 }
