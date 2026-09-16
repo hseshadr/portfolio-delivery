@@ -47,6 +47,10 @@ dagger call build -o ./dist/module
 The build output is the self-contained module source needed by Dagger. Documentation and tests
 are deliberately excluded from its cache key.
 
+## Architecture
+
+Explore the [interactive runtime map](docs/architecture/index.html).
+
 ## API
 
 | Function | Result | Purpose |
