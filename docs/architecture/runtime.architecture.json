@@ -1,0 +1,156 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Portfolio Delivery — Native Dagger Flow",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/hseshadr/portfolio-delivery",
+      "revision": "cf00b2423ce658e47afdb51339ac655507e2c0b7"
+    },
+    "viewBox": [1390, 680],
+    "views": [
+      {
+        "id": "delivery-path",
+        "label": "Build and publish",
+        "focus": ["developer", "dagger", "module", "build_output", "oci_image", "registry"],
+        "note": "Follow the user goal from Dagger invocation to a digest-pinned registry result."
+      },
+      {
+        "id": "ci-proof",
+        "label": "CI proof",
+        "focus": ["github", "dagger", "module", "quality_container", "quality_tools"],
+        "note": "GitHub is a thin trigger; the same typed checks run inside Dagger."
+      },
+      {
+        "id": "input-boundary",
+        "label": "Minimal inputs",
+        "focus": ["workspace", "module", "build_output", "quality_container"],
+        "note": "Build and quality receive separate, deliberately bounded workspace views."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "developer",
+      "type": "external",
+      "label": "Developer",
+      "sublabel": "dagger call / dagger check",
+      "pos": [40, 303],
+      "size": [150, 66],
+      "sources": [{ "path": "README.md", "line": 5, "end_line": 18, "label": "User goals" }]
+    },
+    {
+      "id": "github",
+      "type": "external",
+      "label": "GitHub Actions",
+      "sublabel": "Pinned event trigger",
+      "pos": [250, 105],
+      "size": [160, 66],
+      "sources": [{ "path": ".github/workflows/dagger.yml", "line": 1, "end_line": 20, "label": "Thin trigger" }]
+    },
+    {
+      "id": "dagger",
+      "type": "cloud",
+      "label": "Dagger Engine",
+      "sublabel": "v0.21.8 execution graph",
+      "tag": "native core types",
+      "pos": [250, 300],
+      "size": [170, 72],
+      "sources": [{ "path": "dagger.json", "line": 1, "end_line": 18, "label": "Module contract" }]
+    },
+    {
+      "id": "workspace",
+      "type": "database",
+      "label": "Workspace Inputs",
+      "sublabel": "Release / quality include sets",
+      "pos": [485, 105],
+      "size": [175, 66],
+      "sources": [{ "path": ".dagger/src/portfolio_delivery_dagger/main.py", "line": 10, "end_line": 22, "label": "Bounded inputs" }]
+    },
+    {
+      "id": "module",
+      "type": "backend",
+      "label": "PortfolioDelivery",
+      "sublabel": "Typed build, checks, publish",
+      "tag": "@object_type",
+      "pos": [485, 300],
+      "size": [175, 72],
+      "sources": [{ "path": ".dagger/src/portfolio_delivery_dagger/main.py", "line": 25, "end_line": 68, "label": "Public API" }]
+    },
+    {
+      "id": "quality_container",
+      "type": "backend",
+      "label": "Quality Container",
+      "sublabel": "Pinned Python + uv cache",
+      "pos": [730, 105],
+      "size": [180, 66],
+      "sources": [{ "path": ".dagger/src/portfolio_delivery_dagger/main.py", "line": 73, "end_line": 83, "label": "Quality runtime" }]
+    },
+    {
+      "id": "quality_tools",
+      "type": "security",
+      "label": "Four Checks",
+      "sublabel": "Ruff · mypy · Xenon · pytest",
+      "pos": [980, 105],
+      "size": [190, 66],
+      "sources": [{ "path": ".dagger/src/portfolio_delivery_dagger/main.py", "line": 34, "end_line": 56, "label": "Registered checks" }]
+    },
+    {
+      "id": "build_output",
+      "type": "database",
+      "label": "Module Directory",
+      "sublabel": "Self-contained export",
+      "pos": [730, 300],
+      "size": [170, 66],
+      "sources": [{ "path": ".dagger/src/portfolio_delivery_dagger/main.py", "line": 29, "end_line": 32, "label": "Native Directory" }]
+    },
+    {
+      "id": "oci_image",
+      "type": "cloud",
+      "label": "Scratch OCI Image",
+      "sublabel": "/module payload",
+      "pos": [970, 300],
+      "size": [170, 66],
+      "sources": [{ "path": ".dagger/src/portfolio_delivery_dagger/main.py", "line": 58, "end_line": 71, "label": "Native image" }]
+    },
+    {
+      "id": "registry",
+      "type": "external",
+      "label": "OCI Registry",
+      "sublabel": "Digest-pinned address",
+      "pos": [1210, 300],
+      "size": [155, 66],
+      "sources": [{ "path": ".dagger/src/portfolio_delivery_dagger/main.py", "line": 58, "end_line": 68, "label": "Publish boundary" }]
+    }
+  ],
+  "connections": [
+    { "id": "developer_invokes", "from": "developer", "to": "dagger", "label": "typed goal", "variant": "emphasis", "fromSide": "right", "toSide": "left", "route": "straight", "labelAt": [220, 386] },
+    { "id": "github_triggers", "from": "github", "to": "dagger", "label": "dagger check", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "labelAt": [330, 235] },
+    { "id": "dagger_resolves", "from": "dagger", "to": "module", "label": "function call", "variant": "emphasis", "labelAt": [453, 386] },
+    { "id": "workspace_selected", "from": "workspace", "to": "module", "label": "bounded source", "fromSide": "bottom", "toSide": "top", "labelAt": [485, 235] },
+    { "id": "module_builds", "from": "module", "to": "build_output", "label": "Directory", "variant": "emphasis", "labelAt": [695, 386] },
+    { "id": "module_checks", "from": "module", "to": "quality_container", "label": "check graph", "variant": "security", "fromSide": "top", "toSide": "bottom", "labelAt": [695, 235] },
+    { "id": "quality_executes", "from": "quality_container", "to": "quality_tools", "label": "frozen toolchain", "variant": "security", "labelAt": [945, 185] },
+    { "id": "output_packages", "from": "build_output", "to": "oci_image", "label": "with_directory", "labelAt": [935, 380] },
+    { "id": "image_publishes", "from": "oci_image", "to": "registry", "label": "Container.publish", "variant": "emphasis", "labelAt": [1175, 380] }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "One execution graph",
+      "items": ["Local and hosted checks call the same Dagger module", "GitHub contains trigger wiring, not delivery logic"]
+    },
+    {
+      "dot": "emerald",
+      "title": "Native composition",
+      "items": ["Build returns a Dagger Directory", "Publish delegates to Container.publish with a Secret"]
+    },
+    {
+      "dot": "amber",
+      "title": "Bounded proof",
+      "items": ["Release and quality inputs are selected independently", "Four registered checks gate the module"]
+    }
+  ]
+}
