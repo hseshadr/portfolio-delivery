@@ -1,7 +1,7 @@
 [project]
 name = "portfolio-delivery"
 version = "0.2.0"
-description = "Lean portfolio delivery with modern Dagger"
+description = "Internal CI tooling for Harish's own repos: a small Dagger module that checks and packages its own code, kept as the example those repos copy"
 requires-python = ">=3.13,<3.14"
 dependencies = []
 

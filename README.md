@@ -1,95 +1,129 @@
 # Portfolio Delivery
 
-## TL;DR
+Internal CI tooling for Harish's own repos: a small Dagger module that checks and packages its own code, kept as the example those repos copy.
 
-Portfolio Delivery is a small Dagger `v0.21.8` module with four checks and two user goals:
+**Try it:** `git clone https://github.com/hseshadr/portfolio-delivery && cd portfolio-delivery && dagger check` (needs Dagger 0.21.8 and Docker running).
 
-```bash
-dagger check
-dagger call build -o ./dist/module
-dagger call publish \
-  --registry=ghcr.io \
-  --address=ghcr.io/OWNER/portfolio-delivery:TAG \
-  --username=OWNER \
-  --password=env:GITHUB_TOKEN
-```
+This is not a product for other people. It is a worked example Harish keeps for his own
+repos. [Dagger](https://dagger.io) runs build and test steps inside containers, so the same
+command gives the same result on a laptop and in GitHub Actions. This repo is one Dagger module
+of about 90 lines of Python. It checks its own code (lint, types, complexity, tests), exports
+itself as a folder, and has a function to push that folder to a container registry (which
+is broken today; see below).
 
-`build` returns a native `Directory`. `publish` uses native `Container.publish` and accepts the
-registry password as a native `Secret`. There is no release framework, controller, workflow
-renderer, artifact DTO, repository layer, or custom OCI client.
+It used to be a custom release framework with its own stages, storage layer and registry
+client. Dagger already does all of that, so version 0.2.0 deleted it and kept only what Dagger
+does not. Today no other repo imports this module. Harish's other repos run their own Dagger
+modules, and this one shows the pattern they follow: CI is a short workflow that runs
+`dagger check`, and the real work lives in typed Dagger functions.
 
-## Why
+**Technical docs:** [Architecture](docs/ARCHITECTURE.md) · [Getting started for developers](docs/GETTING_STARTED.md) · [Interactive architecture map](docs/architecture/index.html)
 
-Dagger already supplies the execution graph, content-addressed caching, typed files and
-directories, services, secret handling, OCI image publication, checks, and traces. Rebuilding
-those capabilities made the previous implementation difficult to use and maintain.
+## Try it
 
-This module follows the official design:
+You need Dagger `0.21.8`, Docker (or another container runtime) running, and
+[uv](https://docs.astral.sh/uv/). Setup steps are in [Getting started](docs/GETTING_STARTED.md).
 
-- the workspace supplies only the files each function needs;
-- checks run with `dagger check` locally and in CI;
-- functions expose user goals rather than internal stages;
-- functions return Dagger core objects so callers can keep composing;
-- publication delegates the side effect to the engine's native `Container.publish` operation.
+1. Clone it and list what the module can do:
 
-## Quickstart
+   ```bash
+   git clone https://github.com/hseshadr/portfolio-delivery
+   cd portfolio-delivery
+   dagger functions
+   ```
 
-Prerequisites: Dagger `v0.21.8`, Python `3.13.14`, and `uv`.
+   ```text
+   Name         Description
+   build        Return the exportable, self-contained module source.
+   complexity   Require Xenon grade A complexity.
+   lint         Check Ruff lint and formatting.
+   publish      Publish the built module with native OCI support.
+   typecheck    Check the module with strict mypy.
+   unit         Run fast, host-independent contract tests.
+   ```
+
+2. Run every check, the same command CI runs. It takes 20 to 35 seconds once Dagger's caches
+   are warm, and exits 0 when all four pass:
+
+   ```bash
+   dagger --progress=plain check
+   ```
+
+   The last lines of the output:
+
+   ```text
+   portfolio-delivery:lint DONE [10.4s]
+   portfolio-delivery:complexity DONE [10.8s]
+   portfolio-delivery:unit DONE [11.1s]
+   portfolio-delivery:typecheck DONE [19.1s]
+   ```
+
+3. Export the module as a folder another repo could load:
+
+   ```bash
+   dagger call build -o ./dist/module
+   ls -A dist/module
+   ```
+
+   ```text
+   Saved to "…/portfolio-delivery/dist/module".
+   .dagger
+   LICENSE
+   dagger.json
+   ```
+
+   Only those three entries go in. The README, docs and tests are left out, so editing them
+   does not change the build.
+
+## How it works
+
+`dagger.json` tells Dagger where the module lives and pins the engine to version 0.21.8. The
+module is one Python class in `.dagger/src/portfolio_delivery_dagger/main.py`. The four check
+functions (`lint`, `typecheck`, `complexity`, `unit`) each start a pinned Python 3.13 container,
+install the dev tools with uv, and run one task. `build` returns the module's own files, and
+`publish` puts them in an image and pushes it with Dagger's built-in `Container.publish`,
+taking the registry password as a Dagger secret so it never appears in logs. The GitHub
+workflow only installs Dagger and runs `dagger check`.
+
+## What it does not do
+
+- **`publish` does not work yet.** It builds its image from `scratch`, which is not a real
+  image, so it fails with `docker.io/library/scratch:latest: not found` before pushing
+  anything. No test pushes an image, so this was not caught. Details are in
+  [Architecture](docs/ARCHITECTURE.md#known-problem-with-publish).
+- **Nothing depends on it.** It is not a shared library or a reusable GitHub workflow that
+  other repos call. It is the reference they copy from.
+- **It only builds itself.** There is no option to point it at another project.
+- **CI skips the slower tests.** CI runs `dagger check`, which runs the quick tests only. The
+  tests that drive the real `dagger` CLI (build is repeatable, the right files are exported,
+  the password is a secret) run only when you run `uv run poe test` locally.
+- **It keeps no release history.** Dagger's cache is not a record of what was published.
+
+If you want CI that runs the same way locally and in the cloud for your own project, start
+from [Dagger's own docs](https://docs.dagger.io) and modules at
+[daggerverse.dev](https://daggerverse.dev), not from this repo.
+
+## Develop
 
 ```bash
 uv sync --python 3.13.14
-uv run poe lock-check
-dagger functions
-dagger check
-dagger call build -o ./dist/module
+dagger check          # what CI runs: lint, typecheck, complexity, unit (20 to 35 s)
+uv run poe test       # every test, including the ones that call the real dagger CLI (about 1 min)
 ```
 
-The build output is the self-contained module source needed by Dagger. Documentation and tests
-are deliberately excluded from its cache key.
+[Getting started for developers](docs/GETTING_STARTED.md) covers setup, the traps we hit, a
+map of the code, a first change, and how to open a PR.
 
-## Architecture
+## More detail
 
-Explore the [interactive runtime map](docs/architecture/index.html).
+- [Architecture](docs/ARCHITECTURE.md): each function, what files it sees, why the old
+  framework was removed, the size limits the tests enforce, and the known `publish` bug.
+- [Getting started for developers](docs/GETTING_STARTED.md): from a fresh clone to a green
+  run and your first change.
+- [Interactive architecture map](docs/architecture/index.html): a clickable diagram, one
+  offline HTML file.
+- [CHANGELOG](CHANGELOG.md): what changed in each version.
 
-## API
+## License
 
-| Function | Result | Purpose |
-|---|---|---|
-| `build` | `Directory` | Return the exportable module source |
-| `lint` | `Container` check | Ruff lint and formatting |
-| `typecheck` | `Container` check | Strict mypy |
-| `complexity` | `Container` check | Xenon grade A |
-| `unit` | `Container` check | Host-independent contract tests |
-| `publish` | digest-pinned `str` | Publish through native OCI support |
-
-GitHub Actions is only a pinned trigger for `dagger check`; it contains no delivery logic.
-
-## Reuse before code
-
-Before adding code:
-
-1. Check Dagger core types and functions.
-2. Search official Dagger modules and toolchains.
-3. Search maintained ecosystem modules.
-4. Add custom code only with a written gap and a behavior test.
-
-Examples of native replacements are `Workspace.directory` for source selection, `@check` for
-validation, `CacheVolume` for tool caches, `Secret` for credentials, `Service` for dependencies,
-`Changeset` for generated edits, and `Container.publish` for container publication.
-
-## Enforced size limits
-
-- Handwritten production Python: at most 400 lines; target 300 or fewer.
-- Handwritten Python tests: at most 800 lines.
-- GitHub trigger: 15–30 lines.
-- Generated Dagger SDK and lock files are excluded.
-
-A change is rejected if it adds a custom DTO for a Dagger core type, wraps a single native
-operation, adds a controller to ordinary CI, duplicates Dagger caching or secret handling, or
-cannot show why a native feature or maintained dependency is insufficient.
-
-## Deliberate boundary
-
-Dagger caching is not a durable cross-run release ledger. If a future product truly requires
-cross-repository compare-and-set coordination, that service must be optional, separate, and
-justified by real consumers. Ordinary check, build, and publish flows do not depend on one.
+MIT. See [LICENSE](LICENSE).
